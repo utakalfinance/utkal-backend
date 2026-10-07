@@ -4,6 +4,7 @@ const {
   loginUser,
   getMe,
   changePassword,
+  updateProfile,
 } = require('../controllers/authController');
 const { protect } = require('../middleware/authMiddleware');
 
@@ -15,6 +16,9 @@ router.post('/login', loginUser);
 
 // GET /api/auth/me - Authenticated Member Profile & Application Info
 router.get('/me', protect, getMe);
+
+// PUT /api/auth/profile - Update Member Profile
+router.put('/profile', protect, updateProfile);
 
 // POST /api/auth/change-password - Member Password Change
 router.post('/change-password', protect, changePassword);

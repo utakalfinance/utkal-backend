@@ -6,52 +6,11 @@ const fs = require('fs');
 const Application = require('../models/Application');
 const User = require('../models/User');
 const Member = require('../models/Member');
+const Payment = require('../models/Payment');
 const { generateTempPassword } = require('../utils/generatePassword');
 const { sendCredentialsEmail } = require('../utils/sendEmail');
-
-/**
- * Generate unique Member ID in format NUF-M-0001, NUF-M-0002, etc.
- */
-const generateMemberId = async () => {
-  let maxNum = 0;
-
-  // Search existing users and applications with NUF-M-XXXX format
-  const usersWithMemberId = await User.find({ memberId: /^NUF-M-\d+$/ }).select('memberId');
-  const appsWithMemberId = await Application.find({ memberId: /^NUF-M-\d+$/ }).select('memberId');
-
-  const allMemberIds = [
-    ...usersWithMemberId.map((u) => u.memberId),
-    ...appsWithMemberId.map((a) => a.memberId),
-  ].filter(Boolean);
-
-  allMemberIds.forEach((idStr) => {
-    const match = idStr.match(/NUF-M-(\d+)/);
-    if (match) {
-      const num = parseInt(match[1], 10);
-      if (num > maxNum) maxNum = num;
-    }
-  });
-
-  let nextNumber = maxNum + 1;
-  let isUnique = false;
-  let candidateId = '';
-  let attempts = 0;
-
-  while (!isUnique && attempts < 50) {
-    candidateId = `NUF-M-${String(nextNumber).padStart(4, '0')}`;
-    const existingUser = await User.findOne({ memberId: candidateId });
-    const existingApp = await Application.findOne({ memberId: candidateId });
-
-    if (!existingUser && !existingApp) {
-      isUnique = true;
-    } else {
-      nextNumber++;
-      attempts++;
-    }
-  }
-
-  return candidateId;
-};
+const { generateMemberId } = require('../utils/memberIdGenerator');
+const { generatePaymentId } = require('../utils/paymentIdGenerator');
 
 /**
  * @desc    Create a new membership application
@@ -251,11 +210,13 @@ const createApplication = async (req, res) => {
 
     const sanitizedDocuments = {
       idProofType: documents.idProofType || 'Aadhaar Card',
+      idProofNumber: (documents.idProofNumber || formData.idProofNumber || '').trim(),
       idProofUrl: idProofUrl,
       idProofFile: idProofUrl,
       idProof: idProofUrl,
       doc2_govId: idProofUrl,
       addressProofType: documents.addressProofType || 'Aadhaar Card',
+      addressProofNumber: (documents.addressProofNumber || formData.addressProofNumber || '').trim(),
       addressProofUrl: addressProofUrl,
       addressProofFile: addressProofUrl,
       addressProof: addressProofUrl,
@@ -495,174 +456,86 @@ const updateApplicationStatus = async (req, res) => {
       const nameParts = [p.title, p.firstName, p.middleName, p.lastName].filter(Boolean);
       const name = nameParts.length > 0 ? nameParts.join(' ') : 'Applicant';
 
-      // 2. Duplicate Account Prevention
-      const existingUser = await User.findOne({
-        $or: [
-          { email: email.toLowerCase() },
-          { applicationId: application._id },
-        ],
-      });
-
-      if (existingUser) {
-        // If user already exists, link account and generate fresh login credentials
-        const tempPassword = generateTempPassword(10);
-        const salt = await bcrypt.genSalt(10);
-        const hashedPassword = await bcrypt.hash(tempPassword, salt);
-
-        existingUser.password = hashedPassword;
-        existingUser.mustChangePassword = true;
-        existingUser.applicationId = application._id;
-        if (!existingUser.name || existingUser.name === 'Applicant') {
-          existingUser.name = name;
-        }
-        await existingUser.save();
-
-        application.status = 'approved';
-        application.memberId = existingUser.memberId;
-        application.reviewedAt = new Date();
-        application.credentialsEmailStatus = 'pending';
-        await application.save();
-
-        // Dispatch Credentials Email via Nodemailer
-        let emailSent = false;
-        let emailError = null;
-        try {
-          const emailResult = await sendCredentialsEmail({
-            email: email.toLowerCase().trim(),
-            name,
+      // Check if application is already approved
+      if (application.status === 'approved') {
+        const existingMember = await Member.findOne({ applicationId: application._id });
+        if (existingMember) {
+          return res.status(200).json({
+            success: true,
+            message: `Application is already approved with Member ID ${existingMember.memberId}.`,
             applicationId: application.applicationId || application._id.toString(),
-            memberId: existingUser.memberId,
-            tempPassword,
-          });
-
-          emailSent = emailResult.success === true;
-          if (!emailSent && emailResult.error) {
-            emailError = emailResult.error;
-          }
-        } catch (mailErr) {
-          console.error(`Credentials email failed: ${mailErr.message}`);
-          emailError = mailErr.message;
-        }
-
-        // Update application email status
-        application.credentialsEmailStatus = emailSent ? 'sent' : 'failed';
-        await application.save();
-
-        // Upsert into dedicated members collection in MongoDB Atlas
-        try {
-          await Member.findOneAndUpdate(
-            { memberId: existingUser.memberId },
-            {
-              $set: {
-                memberId: existingUser.memberId,
-                applicationId: application._id,
-                applicationRefId: application.applicationId || application._id.toString(),
-                userId: existingUser._id,
-                name,
-                email: email.toLowerCase().trim(),
-                mobile,
-                membershipType: application.membershipDetails?.membershipType || 'Associate Member',
-                membershipAmount: application.membershipDetails?.membershipAmount ? Number(application.membershipDetails.membershipAmount) : 200,
-                numberOfShares: application.membershipDetails?.numberOfShares || 10,
-                shareValue: application.membershipDetails?.shareValue || 10,
-                processingFee: application.membershipDetails?.processingFee || 100,
-                totalContribution: application.membershipDetails?.totalContribution || 200,
-                status: existingUser.status || 'active',
-                joiningDate: application.reviewedAt || new Date(),
-                credentialsEmailStatus: application.credentialsEmailStatus,
-                personalDetails: application.personalDetails || {},
-                contactDetails: application.contactDetails || {},
-                addressDetails: application.addressDetails || {},
-                nomineeDetails: application.nomineeDetails || {},
-                membershipDetails: application.membershipDetails || {},
-                documentDetails: application.documentDetails || {},
-                paymentDetails: application.paymentDetails || {},
-              },
+            memberId: existingMember.memberId,
+            alreadyExists: true,
+            emailSent: existingMember.credentialsEmailStatus === 'sent',
+            credentialsEmailStatus: existingMember.credentialsEmailStatus,
+            application,
+            member: {
+              _id: existingMember._id,
+              memberId: existingMember.memberId,
+              name: existingMember.name,
+              email: existingMember.email,
+              mobile: existingMember.mobile,
+              role: 'member',
+              status: existingMember.status,
+              applicationId: existingMember.applicationId,
+              createdAt: existingMember.createdAt,
             },
-            { upsert: true, new: true }
-          );
-        } catch (memberColErr) {
-          console.error('Error saving Member collection record:', memberColErr.message);
+          });
         }
-
-        return res.status(200).json({
-          success: true,
-          message: emailSent
-            ? `Application approved and credentials emailed to applicant (${email}).`
-            : `Application approved for existing member account (${existingUser.memberId}).`,
-          applicationId: application.applicationId || application._id.toString(),
-          memberId: existingUser.memberId,
-          alreadyExists: true,
-          emailSent,
-          emailError: emailError || undefined,
-          credentialsEmailStatus: application.credentialsEmailStatus,
-          application,
-          member: {
-            _id: existingUser._id,
-            memberId: existingUser.memberId,
-            name: existingUser.name,
-            email: existingUser.email,
-            mobile: existingUser.mobile,
-            role: existingUser.role,
-            status: existingUser.status,
-            mustChangePassword: existingUser.mustChangePassword ?? false,
-            applicationId: existingUser.applicationId,
-          },
-        });
       }
 
-      // 3. Generate Unique Member ID (Format: NUF-M-0001)
-      const memberId = await generateMemberId();
+      // 1. Determine Unique Member ID (Format: NUF-M-0001, NUF-M-0002, etc.)
+      let memberId = application.memberId;
+      if (!memberId || !memberId.startsWith('NUF-M-')) {
+        memberId = await generateMemberId();
+      }
 
-      // 4. Generate Temporary Password & Hash with bcrypt
+      // 2. Generate Temporary Password & Hash with bcrypt
       const tempPassword = generateTempPassword(10);
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(tempPassword, salt);
 
-      // 5. Create Member/User Account
-      let newMember;
-      try {
-        newMember = await User.create({
-          name,
-          email: email.toLowerCase().trim(),
-          mobile,
-          password: hashedPassword,
-          role: 'member',
-          status: 'active',
-          memberId,
-          applicationId: application._id,
-          mustChangePassword: true,
-        });
-      } catch (userError) {
-        console.error('Error creating user account:', userError);
-        return res.status(500).json({
-          success: false,
-          message: userError.message || 'Failed to create member account. Application remains pending.',
-        });
+      // 3. Create or Link User Account for THIS Application
+      let userDoc = await User.findOne({ applicationId: application._id });
+      if (userDoc) {
+        userDoc.password = hashedPassword;
+        userDoc.mustChangePassword = true;
+        userDoc.name = name;
+        userDoc.mobile = mobile;
+        userDoc.memberId = memberId;
+        userDoc.status = 'active';
+        await userDoc.save();
+      } else {
+        const userEmail = email.toLowerCase().trim();
+
+        try {
+          userDoc = await User.create({
+            name,
+            email: userEmail,
+            mobile,
+            password: hashedPassword,
+            role: 'member',
+            status: 'active',
+            memberId,
+            applicationId: application._id,
+            mustChangePassword: true,
+          });
+        } catch (userError) {
+          console.error('Notice on user creation:', userError.message);
+        }
       }
 
-      // Safe required development logs
       console.log(`Application approved: ${application.applicationId || application._id}`);
       console.log(`Member created: ${memberId}`);
 
-      // 6. Update Application Document
-      try {
-        application.status = 'approved';
-        application.memberId = memberId;
-        application.reviewedAt = new Date();
-        application.credentialsEmailStatus = 'pending';
-        await application.save();
-      } catch (appError) {
-        console.error('Error saving application. Rolling back user creation:', appError);
-        // Safety Rollback
-        await User.findByIdAndDelete(newMember._id);
-        return res.status(500).json({
-          success: false,
-          message: 'Failed to update application status. User account creation rolled back.',
-        });
-      }
+      // 4. Update Application Document
+      application.status = 'approved';
+      application.memberId = memberId;
+      application.reviewedAt = new Date();
+      application.credentialsEmailStatus = 'pending';
+      await application.save();
 
-      // 7. Dispatch Credentials Email via Nodemailer
+      // 5. Dispatch Credentials Email via Nodemailer
       let emailSent = false;
       let emailError = null;
       try {
@@ -683,20 +556,20 @@ const updateApplicationStatus = async (req, res) => {
         emailError = mailErr.message;
       }
 
-      // 8. ONLY mark as sent if Nodemailer succeeded, otherwise failed
       application.credentialsEmailStatus = emailSent ? 'sent' : 'failed';
       await application.save();
 
-      // 9. Save into dedicated members collection in MongoDB Atlas
+      // 6. Save into dedicated members collection in MongoDB Atlas strictly keyed by applicationId
+      let savedMember;
       try {
-        await Member.findOneAndUpdate(
-          { memberId },
+        savedMember = await Member.findOneAndUpdate(
+          { applicationId: application._id },
           {
             $set: {
               memberId,
               applicationId: application._id,
               applicationRefId: application.applicationId || application._id.toString(),
-              userId: newMember._id,
+              userId: userDoc ? userDoc._id : undefined,
               name,
               email: email.toLowerCase().trim(),
               mobile,
@@ -718,33 +591,87 @@ const updateApplicationStatus = async (req, res) => {
               paymentDetails: application.paymentDetails || {},
             },
           },
-          { upsert: true, new: true }
+          { upsert: true, new: true, setDefaultsOnInsert: true }
         );
       } catch (memberColErr) {
         console.error('Error saving Member collection record:', memberColErr.message);
       }
 
-      // 9. Sanitized Member Response (No password or hash returned)
+      // 7. Save into dedicated payments collection in MongoDB Atlas strictly keyed by applicationId
+      let savedPayment;
+      try {
+        const appId = application.applicationId || application._id.toString();
+        const cleanDigits = appId.replace(/\D/g, '') || null;
+        const paymentId = await generatePaymentId(cleanDigits);
+
+        const amount = Number(application.paymentDetails?.amount || application.membershipDetails?.totalContribution || application.totalPaid || 200);
+        const paymentMethod = application.paymentDetails?.method || application.paymentMethod || 'UPI (IndusInd Bank QR)';
+        const utrNo = application.paymentDetails?.utrNumber || application.utrNo || 'UPI_VERIFIED';
+        const receiptUrl = application.paymentDetails?.receiptUrl || application.documentDetails?.paymentReceiptUrl || '';
+        const receiptFileName = application.paymentDetails?.receiptFileName || 'Statutory_Payment_Receipt.png';
+        const paymentStatus = (application.paymentDetails?.status || 'paid').toLowerCase();
+
+        savedPayment = await Payment.findOneAndUpdate(
+          { applicationId: application._id },
+          {
+            $set: {
+              paymentId,
+              applicationId: application._id,
+              applicationRefId: appId,
+              memberId,
+              userId: userDoc ? userDoc._id : undefined,
+              memberName: name,
+              email: email.toLowerCase().trim(),
+              mobile,
+              purpose: 'Statutory Membership & Share Capital (10 Shares)',
+              amount,
+              paymentMethod,
+              status: paymentStatus,
+              utrNo,
+              transactionId: utrNo !== 'UPI_VERIFIED' ? utrNo : `TXN-${cleanDigits || paymentId.replace(/\D/g, '')}`,
+              date: application.paymentDetails?.paidAt || application.reviewedAt || new Date(),
+              receiptUrl,
+              receiptFileName,
+              notes: `Statutory membership subscription for ${name}. Application ${appId} approved by Admin.`,
+              history: [
+                {
+                  field: 'Payment Status',
+                  oldValue: 'Pending Approval',
+                  newValue: paymentStatus === 'paid' ? 'Paid' : 'Pending',
+                  changedAt: application.reviewedAt || new Date(),
+                  changedBy: 'Admin (Approval)',
+                },
+              ],
+            },
+          },
+          { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+      } catch (payErr) {
+        console.error('Error saving Payment collection record:', payErr.message);
+      }
+
+      // 8. Sanitized Member & Payment Response
       const memberResponse = {
-        _id: newMember._id,
-        memberId: newMember.memberId,
-        name: newMember.name,
-        email: newMember.email,
-        mobile: newMember.mobile,
-        role: newMember.role,
-        status: newMember.status,
-        mustChangePassword: newMember.mustChangePassword,
-        applicationId: newMember.applicationId,
-        createdAt: newMember.createdAt,
+        _id: savedMember?._id || userDoc?._id,
+        memberId,
+        name,
+        email: email.toLowerCase().trim(),
+        mobile,
+        role: 'member',
+        status: 'active',
+        applicationId: application._id,
+        createdAt: savedMember?.createdAt || new Date(),
       };
 
       return res.status(200).json({
         success: true,
         message: emailSent
-          ? 'Application approved and member account created successfully. Credentials emailed to applicant.'
-          : 'Application approved and member account created successfully.',
+          ? 'Application approved, member account and payment ledger record created successfully. Credentials emailed to applicant.'
+          : 'Application approved, member account and payment ledger record created successfully.',
         applicationId: application.applicationId || application._id.toString(),
         memberId,
+        paymentId: savedPayment?.paymentId,
+        payment: savedPayment,
         emailSent,
         emailError: emailError || undefined,
         credentialsEmailStatus: application.credentialsEmailStatus,

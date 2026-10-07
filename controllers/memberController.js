@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const Application = require('../models/Application');
 const User = require('../models/User');
 const Member = require('../models/Member');
+const { generateMemberId } = require('../utils/memberIdGenerator');
 
 /**
  * Helper to format date into '29 Sep 2026'
@@ -22,156 +23,188 @@ const formatDate = (dateInput) => {
 };
 
 /**
- * @desc    Get all real approved members from MongoDB
+ * Format a Member document from MongoDB into a standard API response
+ */
+const formatMemberRecord = (memberDoc) => {
+  if (!memberDoc) return null;
+  const m = memberDoc.toObject ? memberDoc.toObject() : memberDoc;
+  const p = m.personalDetails || {};
+  const c = m.contactDetails || {};
+  const a = m.addressDetails || {};
+  const n = m.nomineeDetails || {};
+  const mem = m.membershipDetails || {};
+  const doc = m.documentDetails || {};
+
+  const nameParts = [p.title, p.firstName, p.middleName, p.lastName].filter(Boolean);
+  const applicantName = m.name || (nameParts.length > 0 ? nameParts.join(' ') : 'Valued Member');
+
+  const memberId = m.memberId || 'NUF-M-0001';
+  const membershipStatus = (m.status || 'active').toLowerCase() === 'inactive' ? 'Inactive' : 'Active';
+
+  // Build documents list
+  const documentsList = [];
+  const defaultVerification = 'Verified';
+
+  const idType = (doc.idProofType || 'Aadhaar Card').trim();
+  const addrType = (doc.addressProofType || 'Aadhaar Card').trim();
+  const isIdAadhaar = idType.toLowerCase().includes('aadhaar');
+  const isAddrAadhaar = addrType.toLowerCase().includes('aadhaar');
+  const isSameUrl = doc.idProofUrl && doc.addressProofUrl && doc.idProofUrl === doc.addressProofUrl;
+
+  if (doc.idProofUrl) {
+    const isCombined = (isIdAadhaar && isAddrAadhaar) || isSameUrl;
+    documentsList.push({
+      id: `${m._id}-idproof`,
+      documentType: isCombined ? 'Identity & Address Proof' : 'Identity Proof',
+      documentName: isCombined ? `${idType} (Identity & Address Proof)` : `${idType} (ID Proof)`,
+      documentUrl: doc.idProofUrl,
+      uploadedAt: m.createdAt || m.joiningDate,
+      verificationStatus: defaultVerification,
+    });
+  }
+
+  if (doc.addressProofUrl) {
+    const isDuplicateAadhaar = isAddrAadhaar && (isIdAadhaar || isSameUrl);
+    if (!doc.idProofUrl || (!isDuplicateAadhaar && !documentsList.some((d) => d.documentUrl === doc.addressProofUrl))) {
+      documentsList.push({
+        id: `${m._id}-addressproof`,
+        documentType: 'Address Proof',
+        documentName: `${addrType || 'Address Document'} (Address Proof)`,
+        documentUrl: doc.addressProofUrl,
+        uploadedAt: m.createdAt || m.joiningDate,
+        verificationStatus: defaultVerification,
+      });
+    }
+  }
+
+  if (doc.photoUrl) {
+    documentsList.push({
+      id: `${m._id}-photo`,
+      documentType: 'Photograph',
+      documentName: 'Passport Photograph',
+      documentUrl: doc.photoUrl,
+      uploadedAt: m.createdAt || m.joiningDate,
+      verificationStatus: defaultVerification,
+    });
+  }
+
+  if (doc.signatureUrl) {
+    documentsList.push({
+      id: `${m._id}-signature`,
+      documentType: 'Signature',
+      documentName: 'Digital Signature Specimen',
+      documentUrl: doc.signatureUrl,
+      uploadedAt: m.createdAt || m.joiningDate,
+      verificationStatus: defaultVerification,
+    });
+  }
+
+  if (Array.isArray(doc.additionalDocuments)) {
+    doc.additionalDocuments.forEach((addDoc, idx) => {
+      if (addDoc.documentUrl) {
+        documentsList.push({
+          id: addDoc._id ? addDoc._id.toString() : `${m._id}-add-${idx}`,
+          documentType: addDoc.documentType || 'Additional Document',
+          documentName: addDoc.documentName || addDoc.documentType || 'Supporting Document',
+          documentUrl: addDoc.documentUrl,
+          uploadedAt: addDoc.uploadedAt || m.createdAt || m.joiningDate,
+          verificationStatus: defaultVerification,
+        });
+      }
+    });
+  }
+
+  return {
+    _id: m._id,
+    id: memberId,
+    memberId,
+    applicationId: m.applicationRefId || (m.applicationId ? m.applicationId.toString() : ''),
+    name: applicantName,
+    applicantName,
+    email: m.email || c.email || '',
+    mobile: m.mobile || c.mobile || '',
+    membershipType: m.membershipType || mem.membershipType || 'Associate Member',
+    membershipAmount: String(m.membershipAmount || mem.membershipAmount || 200),
+    numberOfShares: m.numberOfShares || mem.numberOfShares || 10,
+    shareValue: m.shareValue || mem.shareValue || 10,
+    processingFee: m.processingFee || mem.processingFee || 100,
+    totalContribution: m.totalContribution || mem.totalContribution || 200,
+    status: (m.status || 'active').toLowerCase(),
+    membershipStatus,
+    joiningDate: formatDate(m.joiningDate || m.createdAt),
+    createdAt: m.createdAt || m.joiningDate,
+    personalDetails: p,
+    contactDetails: c,
+    addressDetails: a,
+    nomineeDetails: n,
+    membershipDetails: mem,
+    documentDetails: doc,
+    documents: documentsList,
+    paymentDetails: m.paymentDetails || {},
+  };
+};
+
+/**
+ * @desc    Get all real approved members from MongoDB members collection
  * @route   GET /api/members
  * @access  Public / Admin
  */
 const getMembers = async (req, res) => {
   try {
-    // 1. Find all applications with status "approved"
-    const approvedApps = await Application.find({ status: 'approved' }).sort({ createdAt: -1 });
-
-    // 2. Find all users with role "member"
-    const memberUsers = await User.find({ role: 'member' });
-
-    // Create lookup map of users by memberId and by applicationId
-    const userByMemberIdMap = {};
-    const userByAppIdMap = {};
-
-    memberUsers.forEach((u) => {
-      if (u.memberId) userByMemberIdMap[u.memberId] = u;
-      if (u.applicationId) userByAppIdMap[u.applicationId.toString()] = u;
-    });
-
-    const membersList = approvedApps.map((app) => {
-      const p = app.personalDetails || {};
-      const c = app.contactDetails || {};
-      const a = app.addressDetails || {};
-      const n = app.nomineeDetails || {};
-      const m = app.membershipDetails || {};
-      const doc = app.documentDetails || {};
-
-      const nameParts = [p.title, p.firstName, p.middleName, p.lastName].filter(Boolean);
-      const applicantName = nameParts.length > 0 ? nameParts.join(' ') : 'Applicant';
-
-      const userRecord = userByMemberIdMap[app.memberId] || userByAppIdMap[app._id.toString()];
-
-      const memberId = app.memberId || (userRecord ? userRecord.memberId : 'NUF-M-0001');
-      const membershipStatus = userRecord ? (userRecord.status === 'inactive' ? 'Inactive' : 'Active') : 'Active';
-
-      // Build document items list for this member
-      const documentsList = [];
-      const defaultVerification = 'Verified';
-
-      const idType = (doc.idProofType || 'Aadhaar Card').trim();
-      const addrType = (doc.addressProofType || 'Aadhaar Card').trim();
-      const isIdAadhaar = idType.toLowerCase().includes('aadhaar');
-      const isAddrAadhaar = addrType.toLowerCase().includes('aadhaar');
-      const isSameUrl = doc.idProofUrl && doc.addressProofUrl && doc.idProofUrl === doc.addressProofUrl;
-
-      if (doc.idProofUrl) {
-        const isCombined = (isIdAadhaar && isAddrAadhaar) || isSameUrl;
-        documentsList.push({
-          id: `${app._id}-idproof`,
-          documentType: isCombined ? 'Identity & Address Proof' : 'Identity Proof',
-          documentName: isCombined
-            ? `${idType} (Identity & Address Proof)`
-            : `${idType} (ID Proof)`,
-          documentUrl: doc.idProofUrl,
-          uploadedAt: app.submittedAt || app.createdAt,
-          verificationStatus: defaultVerification,
-        });
-      }
-
-      if (doc.addressProofUrl) {
-        const isDuplicateAadhaar = isAddrAadhaar && (isIdAadhaar || isSameUrl);
-        if (!doc.idProofUrl) {
-          documentsList.push({
-            id: `${app._id}-addressproof`,
-            documentType: 'Address Proof',
-            documentName: `${addrType || 'Address Document'} (Address Proof)`,
-            documentUrl: doc.addressProofUrl,
-            uploadedAt: app.submittedAt || app.createdAt,
-            verificationStatus: defaultVerification,
-          });
-        } else if (!isDuplicateAadhaar && !documentsList.some(d => d.documentUrl === doc.addressProofUrl)) {
-          documentsList.push({
-            id: `${app._id}-addressproof`,
-            documentType: 'Address Proof',
-            documentName: `${addrType || 'Address Document'} (Address Proof)`,
-            documentUrl: doc.addressProofUrl,
-            uploadedAt: app.submittedAt || app.createdAt,
-            verificationStatus: defaultVerification,
-          });
+    // 1. Sync any approved application that might be missing a Member document in MongoDB
+    const approvedApps = await Application.find({ status: 'approved' });
+    for (const app of approvedApps) {
+      const existingMember = await Member.findOne({ applicationId: app._id });
+      if (!existingMember) {
+        let memberId = app.memberId;
+        if (!memberId || !memberId.startsWith('NUF-M-')) {
+          memberId = await generateMemberId();
+          app.memberId = memberId;
+          await app.save();
         }
-      }
 
-      if (doc.photoUrl) {
-        documentsList.push({
-          id: `${app._id}-photo`,
-          documentType: 'Photograph',
-          documentName: 'Passport Photograph',
-          documentUrl: doc.photoUrl,
-          uploadedAt: app.submittedAt || app.createdAt,
-          verificationStatus: defaultVerification,
-        });
-      }
+        const p = app.personalDetails || {};
+        const nameParts = [p.title || app.title, p.firstName || app.firstName, p.middleName || app.middleName, p.lastName || app.lastName].filter(Boolean);
+        const name = nameParts.length > 0 ? nameParts.join(' ') : (app.applicantName || 'Applicant');
+        const email = (app.contactDetails?.email || app.email || `member_${memberId.toLowerCase().replace(/[^a-z0-9]/g, '')}@utkalfinance.com`).toLowerCase().trim();
+        const mobile = app.contactDetails?.mobile || app.mobile || '';
 
-      if (doc.signatureUrl) {
-        documentsList.push({
-          id: `${app._id}-signature`,
-          documentType: 'Signature',
-          documentName: 'Digital Signature Specimen',
-          documentUrl: doc.signatureUrl,
-          uploadedAt: app.submittedAt || app.createdAt,
-          verificationStatus: defaultVerification,
-        });
+        await Member.findOneAndUpdate(
+          { applicationId: app._id },
+          {
+            $set: {
+              memberId,
+              applicationId: app._id,
+              applicationRefId: app.applicationId || app._id.toString(),
+              name,
+              email,
+              mobile,
+              membershipType: app.membershipDetails?.membershipType || 'Associate Member',
+              membershipAmount: app.membershipDetails?.membershipAmount ? Number(app.membershipDetails.membershipAmount) : 200,
+              numberOfShares: app.membershipDetails?.numberOfShares || 10,
+              shareValue: app.membershipDetails?.shareValue || 10,
+              processingFee: app.membershipDetails?.processingFee || 100,
+              totalContribution: app.membershipDetails?.totalContribution || 200,
+              status: 'active',
+              joiningDate: app.reviewedAt || app.submittedAt || app.createdAt || new Date(),
+              credentialsEmailStatus: app.credentialsEmailStatus || 'pending',
+              personalDetails: app.personalDetails || {},
+              contactDetails: app.contactDetails || {},
+              addressDetails: app.addressDetails || {},
+              nomineeDetails: app.nomineeDetails || {},
+              membershipDetails: app.membershipDetails || {},
+              documentDetails: app.documentDetails || {},
+              paymentDetails: app.paymentDetails || {},
+            },
+          },
+          { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
       }
+    }
 
-      if (Array.isArray(doc.additionalDocuments)) {
-        doc.additionalDocuments.forEach((addDoc, idx) => {
-          if (addDoc.documentUrl) {
-            documentsList.push({
-              id: addDoc._id ? addDoc._id.toString() : `${app._id}-add-${idx}`,
-              documentType: addDoc.documentType || 'Additional Document',
-              documentName: addDoc.documentName || addDoc.documentType || 'Supporting Document',
-              documentUrl: addDoc.documentUrl,
-              uploadedAt: addDoc.uploadedAt || app.submittedAt || app.createdAt,
-              verificationStatus: defaultVerification,
-            });
-          }
-        });
-      }
-
-      return {
-        _id: app._id,
-        id: memberId,
-        memberId,
-        applicationId: app.applicationId || app._id.toString(),
-        name: applicantName,
-        applicantName,
-        email: c.email || (userRecord ? userRecord.email : ''),
-        mobile: c.mobile || (userRecord ? userRecord.mobile : ''),
-        membershipType: m.membershipType || 'Associate Member',
-        membershipAmount: m.membershipAmount || '200',
-        numberOfShares: m.numberOfShares || 10,
-        shareValue: m.shareValue || 10,
-        processingFee: m.processingFee || 100,
-        totalContribution: m.totalContribution || 200,
-        status: membershipStatus.toLowerCase(),
-        membershipStatus,
-        joiningDate: formatDate(app.reviewedAt || app.submittedAt || app.createdAt),
-        createdAt: app.reviewedAt || app.submittedAt || app.createdAt,
-        personalDetails: p,
-        contactDetails: c,
-        addressDetails: a,
-        nomineeDetails: n,
-        membershipDetails: m,
-        documentDetails: doc,
-        documents: documentsList,
-        appRecord: app,
-      };
-    });
+    // 2. Fetch directly from the real Member collection in MongoDB
+    const membersFromDb = await Member.find().sort({ createdAt: -1 });
+    const membersList = membersFromDb.map(formatMemberRecord);
 
     return res.status(200).json({
       success: true,
@@ -196,152 +229,76 @@ const getMemberById = async (req, res) => {
   try {
     const { id } = req.params;
 
-    let app = await Application.findOne({
+    let member = await Member.findOne({
       $or: [
         { memberId: id },
-        { applicationId: id },
-        ...(mongoose.Types.ObjectId.isValid(id) ? [{ _id: id }] : []),
+        { applicationRefId: id },
+        ...(mongoose.Types.ObjectId.isValid(id) ? [{ _id: id }, { applicationId: id }] : []),
       ],
-      status: 'approved',
     });
 
-    if (!app) {
+    if (!member) {
+      // Fallback: check if approved application exists and create member
+      const app = await Application.findOne({
+        $or: [
+          { memberId: id },
+          { applicationId: id },
+          ...(mongoose.Types.ObjectId.isValid(id) ? [{ _id: id }] : []),
+        ],
+        status: 'approved',
+      });
+
+      if (app) {
+        const p = app.personalDetails || {};
+        const nameParts = [p.title, p.firstName, p.middleName, p.lastName].filter(Boolean);
+        const name = nameParts.length > 0 ? nameParts.join(' ') : 'Applicant';
+        const email = (app.contactDetails?.email || app.email || `member_${app._id}@utkalfinance.com`).toLowerCase().trim();
+        const memberId = app.memberId || `NUF-M-${(app.applicationId || app._id.toString()).replace(/\D/g, '').slice(-4).padStart(4, '0')}`;
+
+        member = await Member.findOneAndUpdate(
+          {
+            $or: [{ memberId }, { applicationId: app._id }],
+          },
+          {
+            $set: {
+              memberId,
+              applicationId: app._id,
+              applicationRefId: app.applicationId || app._id.toString(),
+              name,
+              email,
+              mobile: app.contactDetails?.mobile || '',
+              membershipType: app.membershipDetails?.membershipType || 'Associate Member',
+              membershipAmount: app.membershipDetails?.membershipAmount ? Number(app.membershipDetails.membershipAmount) : 200,
+              numberOfShares: app.membershipDetails?.numberOfShares || 10,
+              shareValue: app.membershipDetails?.shareValue || 10,
+              processingFee: app.membershipDetails?.processingFee || 100,
+              totalContribution: app.membershipDetails?.totalContribution || 200,
+              status: 'active',
+              joiningDate: app.reviewedAt || new Date(),
+              personalDetails: app.personalDetails || {},
+              contactDetails: app.contactDetails || {},
+              addressDetails: app.addressDetails || {},
+              nomineeDetails: app.nomineeDetails || {},
+              membershipDetails: app.membershipDetails || {},
+              documentDetails: app.documentDetails || {},
+              paymentDetails: app.paymentDetails || {},
+            },
+          },
+          { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+      }
+    }
+
+    if (!member) {
       return res.status(404).json({
         success: false,
         message: `Approved member not found for ID "${id}"`,
       });
     }
 
-    const userRecord = await User.findOne({
-      $or: [
-        { memberId: app.memberId },
-        { applicationId: app._id },
-        { email: app.contactDetails?.email },
-      ],
-    });
-
-    const p = app.personalDetails || {};
-    const c = app.contactDetails || {};
-    const a = app.addressDetails || {};
-    const n = app.nomineeDetails || {};
-    const m = app.membershipDetails || {};
-    const doc = app.documentDetails || {};
-
-    const nameParts = [p.title, p.firstName, p.middleName, p.lastName].filter(Boolean);
-    const applicantName = nameParts.length > 0 ? nameParts.join(' ') : 'Applicant';
-    const memberId = app.memberId || (userRecord ? userRecord.memberId : id);
-    const membershipStatus = userRecord ? (userRecord.status === 'inactive' ? 'Inactive' : 'Active') : 'Active';
-
-    // Documents list
-    const documentsList = [];
-    const idType = (doc.idProofType || 'Aadhaar Card').trim();
-    const addrType = (doc.addressProofType || 'Aadhaar Card').trim();
-    const isIdAadhaar = idType.toLowerCase().includes('aadhaar');
-    const isAddrAadhaar = addrType.toLowerCase().includes('aadhaar');
-    const isSameUrl = doc.idProofUrl && doc.addressProofUrl && doc.idProofUrl === doc.addressProofUrl;
-
-    if (doc.idProofUrl) {
-      const isCombined = (isIdAadhaar && isAddrAadhaar) || isSameUrl;
-      documentsList.push({
-        id: `${app._id}-idproof`,
-        documentType: isCombined ? 'Identity & Address Proof' : 'Identity Proof',
-        documentName: isCombined
-          ? `${idType} (Identity & Address Proof)`
-          : `${idType} (ID Proof)`,
-        documentUrl: doc.idProofUrl,
-        uploadedAt: app.submittedAt || app.createdAt,
-        verificationStatus: 'Verified',
-      });
-    }
-    if (doc.addressProofUrl) {
-      const isDuplicateAadhaar = isAddrAadhaar && (isIdAadhaar || isSameUrl);
-      if (!doc.idProofUrl) {
-        documentsList.push({
-          id: `${app._id}-addressproof`,
-          documentType: 'Address Proof',
-          documentName: `${addrType || 'Address Document'} (Address Proof)`,
-          documentUrl: doc.addressProofUrl,
-          uploadedAt: app.submittedAt || app.createdAt,
-          verificationStatus: 'Verified',
-        });
-      } else if (!isDuplicateAadhaar && !documentsList.some(d => d.documentUrl === doc.addressProofUrl)) {
-        documentsList.push({
-          id: `${app._id}-addressproof`,
-          documentType: 'Address Proof',
-          documentName: `${addrType || 'Address Document'} (Address Proof)`,
-          documentUrl: doc.addressProofUrl,
-          uploadedAt: app.submittedAt || app.createdAt,
-          verificationStatus: 'Verified',
-        });
-      }
-    }
-    if (doc.photoUrl) {
-      documentsList.push({
-        id: `${app._id}-photo`,
-        documentType: 'Photograph',
-        documentName: 'Passport Photograph',
-        documentUrl: doc.photoUrl,
-        uploadedAt: app.submittedAt || app.createdAt,
-        verificationStatus: 'Verified',
-      });
-    }
-    if (doc.signatureUrl) {
-      documentsList.push({
-        id: `${app._id}-signature`,
-        documentType: 'Signature',
-        documentName: 'Digital Signature Specimen',
-        documentUrl: doc.signatureUrl,
-        uploadedAt: app.submittedAt || app.createdAt,
-        verificationStatus: 'Verified',
-      });
-    }
-    if (Array.isArray(doc.additionalDocuments)) {
-      doc.additionalDocuments.forEach((addDoc, idx) => {
-        if (addDoc.documentUrl) {
-          documentsList.push({
-            id: addDoc._id ? addDoc._id.toString() : `${app._id}-add-${idx}`,
-            documentType: addDoc.documentType || 'Additional Document',
-            documentName: addDoc.documentName || addDoc.documentType || 'Supporting Document',
-            documentUrl: addDoc.documentUrl,
-            uploadedAt: addDoc.uploadedAt || app.submittedAt || app.createdAt,
-            verificationStatus: 'Verified',
-          });
-        }
-      });
-    }
-
-    const memberData = {
-      _id: app._id,
-      id: memberId,
-      memberId,
-      applicationId: app.applicationId || app._id.toString(),
-      name: applicantName,
-      applicantName,
-      email: c.email || (userRecord ? userRecord.email : ''),
-      mobile: c.mobile || (userRecord ? userRecord.mobile : ''),
-      membershipType: m.membershipType || 'Associate Member',
-      membershipAmount: m.membershipAmount || '200',
-      numberOfShares: m.numberOfShares || 10,
-      shareValue: m.shareValue || 10,
-      processingFee: m.processingFee || 100,
-      totalContribution: m.totalContribution || 200,
-      status: membershipStatus.toLowerCase(),
-      membershipStatus,
-      joiningDate: formatDate(app.reviewedAt || app.submittedAt || app.createdAt),
-      createdAt: app.reviewedAt || app.submittedAt || app.createdAt,
-      personalDetails: p,
-      contactDetails: c,
-      addressDetails: a,
-      nomineeDetails: n,
-      membershipDetails: m,
-      documentDetails: doc,
-      documents: documentsList,
-      appRecord: app,
-    };
-
     return res.status(200).json({
       success: true,
-      member: memberData,
+      member: formatMemberRecord(member),
     });
   } catch (error) {
     console.error('Error fetching member details:', error);
@@ -360,7 +317,7 @@ const getMemberById = async (req, res) => {
 const updateMemberStatus = async (req, res) => {
   try {
     const { id } = req.params;
-    const { status } = req.body; // 'Active', 'Inactive', 'active', 'inactive'
+    const { status } = req.body;
 
     if (!status) {
       return res.status(400).json({
@@ -383,15 +340,17 @@ const updateMemberStatus = async (req, res) => {
       await user.save();
     }
 
-    // Also update dedicated Member collection
-    await Member.findOneAndUpdate(
+    // Update real Member document in MongoDB
+    const updatedMember = await Member.findOneAndUpdate(
       {
         $or: [
           { memberId: id },
+          { applicationRefId: id },
           ...(mongoose.Types.ObjectId.isValid(id) ? [{ _id: id }, { applicationId: id }] : []),
         ],
       },
-      { $set: { status: newStatus } }
+      { $set: { status: newStatus } },
+      { new: true }
     );
 
     return res.status(200).json({
@@ -399,6 +358,7 @@ const updateMemberStatus = async (req, res) => {
       message: `Member status updated to ${newStatus}`,
       memberId: id,
       status: newStatus === 'active' ? 'Active' : 'Inactive',
+      member: formatMemberRecord(updatedMember),
     });
   } catch (error) {
     console.error('Error updating member status:', error);

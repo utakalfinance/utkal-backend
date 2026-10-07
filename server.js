@@ -55,7 +55,9 @@ app.get('/', (req, res) => {
 
 const applicationRoutes = require('./routes/applicationRoutes');
 const memberRoutes = require('./routes/memberRoutes');
+const paymentRoutes = require('./routes/paymentRoutes');
 const authRoutes = require('./routes/authRoutes');
+const profileUpdateRoutes = require('./routes/profileUpdateRoutes');
 
 // Health Check Route: GET /api/health
 app.get('/api/health', (req, res) => {
@@ -70,7 +72,9 @@ app.get('/api/health', (req, res) => {
 // API Routes
 app.use('/api/applications', applicationRoutes);
 app.use('/api/members', memberRoutes);
+app.use('/api/payments', paymentRoutes);
 app.use('/api/auth', authRoutes);
+app.use('/api/profile-updates', profileUpdateRoutes);
 
 // Serve Frontend Production Build if present on Hostinger
 const clientDistPaths = [

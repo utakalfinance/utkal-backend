@@ -87,11 +87,13 @@ const applicationSchema = new mongoose.Schema(
       },
       documentDetails: {
         idProofType: { type: String, trim: true },
+        idProofNumber: { type: String, trim: true },
         idProofUrl: { type: String, trim: true },
         idProofFile: { type: String, trim: true },
         idProof: { type: String, trim: true },
         doc2_govId: { type: String, trim: true },
         addressProofType: { type: String, trim: true },
+        addressProofNumber: { type: String, trim: true },
         addressProofUrl: { type: String, trim: true },
         addressProofFile: { type: String, trim: true },
         addressProof: { type: String, trim: true },

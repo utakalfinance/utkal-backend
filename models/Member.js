@@ -140,8 +140,10 @@ const memberSchema = new mongoose.Schema(
     },
     documentDetails: {
       idProofType: { type: String, trim: true },
+      idProofNumber: { type: String, trim: true },
       idProofUrl: { type: String, trim: true },
       addressProofType: { type: String, trim: true },
+      addressProofNumber: { type: String, trim: true },
       addressProofUrl: { type: String, trim: true },
       photoUrl: { type: String, trim: true },
       signatureUrl: { type: String, trim: true },
