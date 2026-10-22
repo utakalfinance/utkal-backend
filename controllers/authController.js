@@ -111,9 +111,10 @@ const loginUser = async (req, res) => {
       }
     }
 
-    // 3. If still not found, check Application model
+    // Check linked Application model if user is still not resolved
+    let linkedApp = null;
     if (!user) {
-      const linkedApp = await Application.findOne({
+      linkedApp = await Application.findOne({
         $or: [
           { applicationId: idRegex },
           { memberId: idRegex },
@@ -125,10 +126,18 @@ const loginUser = async (req, res) => {
       });
 
       if (linkedApp) {
+        if (linkedApp.status === 'rejected') {
+          return res.status(403).json({
+            success: false,
+            message: 'Your membership application has been rejected by the administrator. Access to the Member Dashboard is not permitted.',
+          });
+        }
+
         user = await User.findOne({
           $or: [
             { applicationId: linkedApp._id },
             ...(linkedApp.memberId ? [{ memberId: linkedApp.memberId }] : []),
+            { email: cleanId },
           ],
         });
       }
@@ -138,6 +147,39 @@ const loginUser = async (req, res) => {
       return res.status(401).json({
         success: false,
         message: 'Invalid Member ID / Email or password',
+      });
+    }
+
+    // Always verify the applicant's linked application status
+    if (!linkedApp) {
+      linkedApp = user.applicationId
+        ? await Application.findById(user.applicationId)
+        : (user.memberId
+            ? await Application.findOne({ memberId: user.memberId })
+            : await Application.findOne({
+                $or: [
+                  { 'contactDetails.email': user.email },
+                  { email: user.email },
+                  ...(user.mobile ? [{ 'contactDetails.mobile': user.mobile }, { mobile: user.mobile }] : []),
+                ],
+              }));
+    }
+
+    if (linkedApp && linkedApp.status === 'rejected') {
+      if (user.status === 'active') {
+        user.status = 'inactive';
+        await user.save().catch(() => {});
+      }
+      return res.status(403).json({
+        success: false,
+        message: 'Your membership application has been rejected by the administrator. Access to the Member Dashboard is not permitted.',
+      });
+    }
+
+    if (linkedApp && linkedApp.status === 'pending') {
+      return res.status(403).json({
+        success: false,
+        message: 'Your membership application is currently pending admin approval. You will receive an email once approved.',
       });
     }
 
@@ -291,6 +333,24 @@ const getMe = async (req, res) => {
         status: 'pending',
       }).sort({ createdAt: -1 }),
     ]);
+
+    if (applicationData && applicationData.status === 'rejected') {
+      if (user.status === 'active') {
+        user.status = 'inactive';
+        await user.save().catch(() => {});
+      }
+      return res.status(403).json({
+        success: false,
+        message: 'Your membership application has been rejected by the administrator. Access to the Member Dashboard is not permitted.',
+      });
+    }
+
+    if (user.status !== 'active') {
+      return res.status(403).json({
+        success: false,
+        message: `Account is ${user.status}. Please contact administrator.`,
+      });
+    }
 
     const formattedPayments = (paymentDocs || []).map((p) => ({
       id: p.paymentId,

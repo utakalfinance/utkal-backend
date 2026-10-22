@@ -28,8 +28,8 @@ router.get('/', getApplications);
 router.post('/', upload.any(), createApplication);
 
 // PUT & PATCH /api/applications/:id - Update/Edit application details
-router.put('/:id', updateApplication);
-router.patch('/:id', updateApplication);
+router.put('/:id', upload.any(), updateApplication);
+router.patch('/:id', upload.any(), updateApplication);
 
 // PATCH /api/applications/:id/status - Update application status (Admin approval)
 router.patch('/:id/status', updateApplicationStatus);

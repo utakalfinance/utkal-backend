@@ -202,6 +202,23 @@ const getMembers = async (req, res) => {
       }
     }
 
+    // 1b. Sync rejected applications so their Member records are marked suspended
+    const rejectedApps = await Application.find({ status: 'rejected' }, '_id memberId');
+    if (rejectedApps.length > 0) {
+      const rejectedAppIds = rejectedApps.map((a) => a._id);
+      const rejectedMemberIds = rejectedApps.map((a) => a.memberId).filter(Boolean);
+      await Member.updateMany(
+        {
+          $or: [
+            { applicationId: { $in: rejectedAppIds } },
+            { memberId: { $in: rejectedMemberIds } },
+          ],
+          status: { $ne: 'suspended' },
+        },
+        { $set: { status: 'suspended' } }
+      );
+    }
+
     // 2. Fetch directly from the real Member collection in MongoDB
     const membersFromDb = await Member.find().sort({ createdAt: -1 });
     const membersList = membersFromDb.map(formatMemberRecord);

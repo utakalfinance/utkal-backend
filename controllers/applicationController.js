@@ -684,6 +684,32 @@ const updateApplicationStatus = async (req, res) => {
     application.status = status;
     if (status === 'rejected') {
       application.reviewedAt = new Date();
+
+      const applicantEmail = (application.contactDetails?.email || application.email || '').toLowerCase().trim();
+
+      // Deactivate any existing User accounts linked to this application
+      await User.updateMany(
+        {
+          $or: [
+            { applicationId: application._id },
+            ...(application.memberId ? [{ memberId: application.memberId }] : []),
+            ...(applicantEmail ? [{ email: applicantEmail }] : []),
+          ],
+        },
+        { $set: { status: 'inactive' } }
+      );
+
+      // Deactivate/suspend any Member records linked to this application
+      await Member.updateMany(
+        {
+          $or: [
+            { applicationId: application._id },
+            ...(application.memberId ? [{ memberId: application.memberId }] : []),
+            ...(applicantEmail ? [{ email: applicantEmail }] : []),
+          ],
+        },
+        { $set: { status: 'suspended' } }
+      );
     }
 
     await application.save();
@@ -705,14 +731,84 @@ const updateApplicationStatus = async (req, res) => {
 };
 
 /**
+ * Utility helper to save base64 data URLs to disk in uploads/documents
+ */
+const saveBase64ToFile = (dataUri, prefix = 'doc') => {
+  if (!dataUri || typeof dataUri !== 'string' || !dataUri.startsWith('data:')) {
+    return dataUri;
+  }
+  try {
+    const matches = dataUri.match(/^data:([A-Za-z0-9\-+\/]+);base64,(.+)$/);
+    if (!matches || matches.length !== 3) {
+      return dataUri;
+    }
+    const mimeType = matches[1];
+    const base64Data = matches[2];
+    const ext = mimeType.includes('pdf')
+      ? '.pdf'
+      : mimeType.includes('png')
+      ? '.png'
+      : mimeType.includes('webp')
+      ? '.webp'
+      : mimeType.includes('svg')
+      ? '.svg'
+      : '.jpg';
+    const filename = `${prefix}-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+    const uploadDir = path.join(__dirname, '../uploads/documents');
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    const filePath = path.join(uploadDir, filename);
+    fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
+    return `/uploads/documents/${filename}`;
+  } catch (err) {
+    console.error('Error saving base64 to file:', err);
+    return dataUri;
+  }
+};
+
+/**
  * @desc    Update/Edit membership application details (Admin edit API)
- * @route   PUT /api/applications/:id
+ * @route   PUT & PATCH /api/applications/:id
  * @access  Admin
  */
 const updateApplication = async (req, res) => {
   try {
     const { id } = req.params;
-    const updateData = req.body || {};
+    const rawBody = req.body || {};
+
+    const parseIfJson = (val) => {
+      if (typeof val === 'string') {
+        try {
+          return JSON.parse(val);
+        } catch (e) {
+          return val;
+        }
+      }
+      return val;
+    };
+
+    const updateData = { ...rawBody };
+
+    // Extract any multipart files uploaded with PUT/PATCH
+    const reqFiles = req.files || [];
+    const getUploadedFileUrl = (fieldNames = []) => {
+      const names = Array.isArray(fieldNames) ? fieldNames : [fieldNames];
+      if (Array.isArray(reqFiles)) {
+        const found = reqFiles.find((f) => f && names.includes(f.fieldname));
+        if (found && found.filename) return `/uploads/documents/${found.filename}`;
+      } else if (reqFiles && typeof reqFiles === 'object') {
+        for (const name of names) {
+          if (Array.isArray(reqFiles[name]) && reqFiles[name][0]?.filename) {
+            return `/uploads/documents/${reqFiles[name][0].filename}`;
+          }
+          if (reqFiles[name]?.filename) {
+            return `/uploads/documents/${reqFiles[name].filename}`;
+          }
+        }
+      }
+      return null;
+    };
 
     let application = null;
     if (mongoose.Types.ObjectId.isValid(id)) {
@@ -730,68 +826,170 @@ const updateApplication = async (req, res) => {
     }
 
     // Update personal details
-    if (updateData.personalDetails) {
+    const personal = parseIfJson(updateData.personalDetails || updateData.personal);
+    if (personal && typeof personal === 'object') {
       const current = application.personalDetails?.toObject?.() || application.personalDetails || {};
       application.personalDetails = {
         ...current,
-        ...updateData.personalDetails,
+        ...personal,
       };
     }
 
     // Update contact details
-    if (updateData.contactDetails) {
+    const contact = parseIfJson(updateData.contactDetails || updateData.contact);
+    if (contact && typeof contact === 'object') {
       const current = application.contactDetails?.toObject?.() || application.contactDetails || {};
       application.contactDetails = {
         ...current,
-        ...updateData.contactDetails,
+        ...contact,
       };
     }
 
     // Update address details
-    if (updateData.addressDetails) {
+    const address = parseIfJson(updateData.addressDetails || updateData.address);
+    if (address && typeof address === 'object') {
       const current = application.addressDetails?.toObject?.() || application.addressDetails || {};
       application.addressDetails = {
         ...current,
-        ...updateData.addressDetails,
+        ...address,
       };
     }
 
     // Update nominee details
-    if (updateData.nomineeDetails) {
+    const nominee = parseIfJson(updateData.nomineeDetails || updateData.nominee);
+    if (nominee && typeof nominee === 'object') {
       const current = application.nomineeDetails?.toObject?.() || application.nomineeDetails || {};
       application.nomineeDetails = {
         ...current,
-        ...updateData.nomineeDetails,
+        ...nominee,
       };
     }
 
     // Update membership details
-    if (updateData.membershipDetails) {
+    const membership = parseIfJson(updateData.membershipDetails || updateData.shares);
+    if (membership && typeof membership === 'object') {
       const current = application.membershipDetails?.toObject?.() || application.membershipDetails || {};
       application.membershipDetails = {
         ...current,
-        ...updateData.membershipDetails,
+        ...membership,
       };
     }
 
-    // Update document details
-    if (updateData.documentDetails || updateData.documents) {
-      const docPayload = updateData.documentDetails || updateData.documents || {};
+    // Update document details with base64 conversion & complete alias synchronization
+    const docPayload = parseIfJson(updateData.documentDetails || updateData.documents) || {};
+    const hasDocUpdates =
+      Object.keys(docPayload).length > 0 ||
+      reqFiles.length > 0 ||
+      updateData.idProofUrl ||
+      updateData.addressProofUrl ||
+      updateData.photoUrl ||
+      updateData.signatureUrl ||
+      updateData.doc3_eduCert ||
+      updateData.doc4_birthCert ||
+      updateData.doc5_utility ||
+      updateData.paymentReceiptUrl;
+
+    if (hasDocUpdates) {
       const current = application.documentDetails?.toObject?.() || application.documentDetails || {};
-      application.documentDetails = {
+
+      const fileIdProof = getUploadedFileUrl(['idProof', 'doc2_govId', 'idProofUrl', 'idProofFile']);
+      const fileAddress = getUploadedFileUrl(['addressProof', 'addressProofUrl', 'addressProofFile']);
+      const filePhoto = getUploadedFileUrl(['photo', 'doc1_photo', 'photoUrl', 'photoFile']);
+      const fileSignature = getUploadedFileUrl(['signature', 'signatureUrl', 'signatureFile']);
+      const fileDoc3 = getUploadedFileUrl(['doc3_eduCert', 'doc3_eduCertFile']);
+      const fileDoc4 = getUploadedFileUrl(['doc4_birthCert', 'doc4_birthCertFile']);
+      const fileDoc5 = getUploadedFileUrl(['doc5_utility', 'doc5_utilityFile']);
+      const fileReceipt = getUploadedFileUrl(['paymentReceipt', 'receiptFile', 'paymentReceiptUrl']);
+
+      const rawIdProof = fileIdProof || docPayload.idProofUrl || docPayload.idProof || docPayload.doc2_govId || updateData.idProofUrl;
+      const rawAddress = fileAddress || docPayload.addressProofUrl || docPayload.addressProof || updateData.addressProofUrl;
+      const rawPhoto = filePhoto || docPayload.photoUrl || docPayload.photo || docPayload.doc1_photo || updateData.photoUrl;
+      const rawSignature = fileSignature || docPayload.signatureUrl || docPayload.signature || updateData.signatureUrl;
+      const rawDoc3 = fileDoc3 || docPayload.doc3_eduCert || updateData.doc3_eduCert;
+      const rawDoc4 = fileDoc4 || docPayload.doc4_birthCert || updateData.doc4_birthCert;
+      const rawDoc5 = fileDoc5 || docPayload.doc5_utility || updateData.doc5_utility;
+      const rawReceipt = fileReceipt || docPayload.paymentReceiptUrl || updateData.paymentReceiptUrl;
+
+      const idProof = rawIdProof !== undefined ? saveBase64ToFile(rawIdProof, 'idProof') : undefined;
+      const addressProof = rawAddress !== undefined ? saveBase64ToFile(rawAddress, 'addressProof') : undefined;
+      const photo = rawPhoto !== undefined ? saveBase64ToFile(rawPhoto, 'photo') : undefined;
+      const signature = rawSignature !== undefined ? saveBase64ToFile(rawSignature, 'signature') : undefined;
+      const doc3 = rawDoc3 !== undefined ? saveBase64ToFile(rawDoc3, 'doc3_eduCert') : undefined;
+      const doc4 = rawDoc4 !== undefined ? saveBase64ToFile(rawDoc4, 'doc4_birthCert') : undefined;
+      const doc5 = rawDoc5 !== undefined ? saveBase64ToFile(rawDoc5, 'doc5_utility') : undefined;
+      const receipt = rawReceipt !== undefined ? saveBase64ToFile(rawReceipt, 'paymentReceipt') : undefined;
+
+      const updatedDocs = {
         ...current,
         ...docPayload,
       };
-      // Keep documents field in sync
-      application.documents = {
-        ...current,
-        ...docPayload,
-      };
+
+      if (idProof !== undefined) {
+        updatedDocs.idProofUrl = idProof;
+        updatedDocs.idProof = idProof;
+        updatedDocs.idProofFile = idProof;
+        updatedDocs.doc2_govId = idProof;
+        application.idProofUrl = idProof;
+        application.idProof = idProof;
+        application.doc2_govId = idProof;
+      }
+      if (docPayload.idProofType) {
+        updatedDocs.idProofType = docPayload.idProofType;
+        application.idProofType = docPayload.idProofType;
+      }
+      if (addressProof !== undefined) {
+        updatedDocs.addressProofUrl = addressProof;
+        updatedDocs.addressProof = addressProof;
+        updatedDocs.addressProofFile = addressProof;
+        application.addressProofUrl = addressProof;
+        application.addressProof = addressProof;
+      }
+      if (docPayload.addressProofType) {
+        updatedDocs.addressProofType = docPayload.addressProofType;
+        application.addressProofType = docPayload.addressProofType;
+      }
+      if (photo !== undefined) {
+        updatedDocs.photoUrl = photo;
+        updatedDocs.photo = photo;
+        updatedDocs.photoFile = photo;
+        updatedDocs.doc1_photo = photo;
+        application.photoUrl = photo;
+        application.photo = photo;
+        application.doc1_photo = photo;
+      }
+      if (signature !== undefined) {
+        updatedDocs.signatureUrl = signature;
+        updatedDocs.signature = signature;
+        updatedDocs.signatureFile = signature;
+        application.signatureUrl = signature;
+        application.signature = signature;
+      }
+      if (doc3 !== undefined) {
+        updatedDocs.doc3_eduCert = doc3;
+        application.doc3_eduCert = doc3;
+      }
+      if (doc4 !== undefined) {
+        updatedDocs.doc4_birthCert = doc4;
+        application.doc4_birthCert = doc4;
+      }
+      if (doc5 !== undefined) {
+        updatedDocs.doc5_utility = doc5;
+        application.doc5_utility = doc5;
+      }
+      if (receipt !== undefined) {
+        updatedDocs.paymentReceiptUrl = receipt;
+        application.paymentReceiptUrl = receipt;
+        if (application.paymentDetails) application.paymentDetails.receiptUrl = receipt;
+        if (application.payment) application.payment.receiptUrl = receipt;
+      }
+
+      application.documentDetails = updatedDocs;
+      application.documents = updatedDocs;
     }
 
     // Update payment details
-    if (updateData.paymentDetails || updateData.payment) {
-      const payPayload = updateData.paymentDetails || updateData.payment || {};
+    const payPayload = parseIfJson(updateData.paymentDetails || updateData.payment);
+    if (payPayload && typeof payPayload === 'object') {
       const current = application.paymentDetails?.toObject?.() || application.paymentDetails || {};
       application.paymentDetails = {
         ...current,
@@ -823,7 +1021,34 @@ const updateApplication = async (req, res) => {
 
     // If status is provided and valid
     if (updateData.status && ['pending', 'approved', 'rejected', 'correction_required'].includes(updateData.status.toLowerCase())) {
-      application.status = updateData.status.toLowerCase();
+      const newStatus = updateData.status.toLowerCase();
+      application.status = newStatus;
+
+      if (newStatus === 'rejected') {
+        const applicantEmail = (application.contactDetails?.email || application.email || '').toLowerCase().trim();
+
+        await User.updateMany(
+          {
+            $or: [
+              { applicationId: application._id },
+              ...(application.memberId ? [{ memberId: application.memberId }] : []),
+              ...(applicantEmail ? [{ email: applicantEmail }] : []),
+            ],
+          },
+          { $set: { status: 'inactive' } }
+        );
+
+        await Member.updateMany(
+          {
+            $or: [
+              { applicationId: application._id },
+              ...(application.memberId ? [{ memberId: application.memberId }] : []),
+              ...(applicantEmail ? [{ email: applicantEmail }] : []),
+            ],
+          },
+          { $set: { status: 'suspended' } }
+        );
+      }
     }
 
     application.reviewedAt = new Date();
@@ -837,6 +1062,7 @@ const updateApplication = async (req, res) => {
       if (nameParts.length > 0) linkedUser.name = nameParts.join(' ');
       if (application.contactDetails?.email) linkedUser.email = application.contactDetails.email.toLowerCase();
       if (application.contactDetails?.mobile) linkedUser.mobile = application.contactDetails.mobile;
+      if (application.status === 'rejected') linkedUser.status = 'inactive';
       await linkedUser.save();
     }
 
@@ -871,12 +1097,36 @@ const uploadDocuments = async (req, res) => {
         : (file.buffer ? `data:${file.mimetype || 'image/jpeg'};base64,${file.buffer.toString('base64')}` : '');
       if (fileUrl) {
         uploadedFiles[fieldname] = fileUrl;
-        if (fieldname === 'doc1_photo') uploadedFiles['photo'] = fileUrl;
-        if (fieldname === 'photo') uploadedFiles['doc1_photo'] = fileUrl;
-        if (fieldname === 'doc2_govId') uploadedFiles['idProof'] = fileUrl;
-        if (fieldname === 'idProof') uploadedFiles['doc2_govId'] = fileUrl;
-        if (fieldname === 'receiptFile') uploadedFiles['paymentReceipt'] = fileUrl;
-        if (fieldname === 'paymentReceipt') uploadedFiles['receiptFile'] = fileUrl;
+        if (['idProof', 'doc2_govId', 'idProofUrl', 'idProofFile'].includes(fieldname)) {
+          uploadedFiles['idProof'] = fileUrl;
+          uploadedFiles['doc2_govId'] = fileUrl;
+          uploadedFiles['idProofUrl'] = fileUrl;
+          uploadedFiles['idProofFile'] = fileUrl;
+        }
+        if (['addressProof', 'addressProofUrl', 'addressProofFile'].includes(fieldname)) {
+          uploadedFiles['addressProof'] = fileUrl;
+          uploadedFiles['addressProofUrl'] = fileUrl;
+          uploadedFiles['addressProofFile'] = fileUrl;
+        }
+        if (['doc1_photo', 'photo', 'photoUrl', 'photoFile'].includes(fieldname)) {
+          uploadedFiles['photo'] = fileUrl;
+          uploadedFiles['doc1_photo'] = fileUrl;
+          uploadedFiles['photoUrl'] = fileUrl;
+          uploadedFiles['photoFile'] = fileUrl;
+        }
+        if (['signature', 'signatureUrl', 'signatureFile'].includes(fieldname)) {
+          uploadedFiles['signature'] = fileUrl;
+          uploadedFiles['signatureUrl'] = fileUrl;
+          uploadedFiles['signatureFile'] = fileUrl;
+        }
+        if (['receiptFile', 'paymentReceipt', 'paymentReceiptUrl'].includes(fieldname)) {
+          uploadedFiles['paymentReceipt'] = fileUrl;
+          uploadedFiles['receiptFile'] = fileUrl;
+          uploadedFiles['paymentReceiptUrl'] = fileUrl;
+        }
+        if (fieldname === 'doc3_eduCert') uploadedFiles['doc3_eduCert'] = fileUrl;
+        if (fieldname === 'doc4_birthCert') uploadedFiles['doc4_birthCert'] = fileUrl;
+        if (fieldname === 'doc5_utility') uploadedFiles['doc5_utility'] = fileUrl;
       }
     };
 

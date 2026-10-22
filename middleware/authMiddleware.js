@@ -1,6 +1,7 @@
 const jwt = require('jsonwebtoken');
 const env = require('../config/env');
 const User = require('../models/User');
+const Application = require('../models/Application');
 
 /**
  * Protect routes: Verify JWT token & attach user to req.user
@@ -41,6 +42,26 @@ const protect = async (req, res, next) => {
           success: false,
           message: `Account is ${user.status}. Please contact administrator.`,
         });
+      }
+
+      // If non-admin user, check if application has been rejected
+      if (user.role !== 'admin') {
+        const application = user.applicationId
+          ? await Application.findById(user.applicationId)
+          : (user.memberId
+              ? await Application.findOne({ memberId: user.memberId })
+              : (user.email ? await Application.findOne({ 'contactDetails.email': user.email }) : null));
+
+        if (application && application.status === 'rejected') {
+          if (user.status === 'active') {
+            user.status = 'inactive';
+            await user.save().catch(() => {});
+          }
+          return res.status(403).json({
+            success: false,
+            message: 'Your membership application has been rejected by the administrator. Access to the Member Dashboard is not permitted.',
+          });
+        }
       }
 
       req.user = user;
