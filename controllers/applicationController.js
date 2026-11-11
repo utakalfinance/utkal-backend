@@ -7,6 +7,7 @@ const Application = require('../models/Application');
 const User = require('../models/User');
 const Member = require('../models/Member');
 const Payment = require('../models/Payment');
+const Referral = require('../models/Referral');
 const { generateTempPassword } = require('../utils/generatePassword');
 const { sendCredentialsEmail } = require('../utils/sendEmail');
 const { generateMemberId } = require('../utils/memberIdGenerator');
@@ -326,6 +327,97 @@ const createApplication = async (req, res) => {
       },
     };
 
+    // 8. Capture Referral Attribution & Auto-record into Referral collection
+    const referralCode = (
+      formData.referralCode ||
+      formData.ref ||
+      account.referralCode ||
+      account.agentCode ||
+      formData.membershipDetails?.introducer ||
+      formData.introducer ||
+      ''
+    ).trim();
+
+    if (referralCode) {
+      try {
+        let referrerMember = await Member.findOne({
+          $or: [
+            { memberId: new RegExp(`^${referralCode}$`, 'i') },
+            ...(mongoose.Types.ObjectId.isValid(referralCode) ? [{ _id: referralCode }] : []),
+          ],
+        }).lean();
+
+        let referrerUser = null;
+        if (!referrerMember) {
+          referrerUser = await User.findOne({
+            $or: [
+              { memberId: new RegExp(`^${referralCode}$`, 'i') },
+              { username: new RegExp(`^${referralCode}$`, 'i') },
+              ...(mongoose.Types.ObjectId.isValid(referralCode) ? [{ _id: referralCode }] : []),
+            ],
+          }).lean();
+        }
+
+        const distName =
+          referrerMember?.addressDetails?.district ||
+          referrerMember?.district ||
+          referrerUser?.assignedDistrict ||
+          address.district ||
+          'Khurda';
+
+        const count = await Referral.countDocuments();
+        const cleanDist = distName.replace(/\s*circle/i, '').trim();
+        const prefix = cleanDist ? cleanDist.slice(0, 3).toUpperCase() : 'REF';
+        const referralId = `REF-${prefix}-${String(count + 1).padStart(4, '0')}`;
+
+        const associateName =
+          referrerMember?.name ||
+          referrerUser?.name ||
+          `Associate (${referralCode})`;
+
+        const associateMemberId =
+          referrerMember?.memberId ||
+          referrerUser?.memberId ||
+          referralCode;
+
+        const applicantFullName = [
+          personal.title,
+          personal.firstName,
+          personal.middleName,
+          personal.lastName,
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .trim() || 'New Applicant';
+
+        const newReferral = await Referral.create({
+          referralId,
+          district: distName,
+          districtPartnerId: referrerUser?.role === 'district_admin' ? referrerUser._id : null,
+          associateId: referrerMember?._id || null,
+          associateMemberId: associateMemberId,
+          associateName: associateName,
+          customerName: applicantFullName,
+          mobile: mobile,
+          email: email,
+          address: [address.villageTown, address.district, address.state].filter(Boolean).join(', '),
+          referralType: 'Member Registration',
+          investmentAmount: 0,
+          tenureMonths: 12,
+          status: 'New',
+          referralCode: referralCode,
+          notes: `Registered online via referral link of ${associateName}`,
+          createdBy: associateName,
+        });
+
+        applicationData.referralId = newReferral.referralId;
+        if (!applicationData.membershipDetails) applicationData.membershipDetails = {};
+        applicationData.membershipDetails.introducer = associateMemberId;
+      } catch (refErr) {
+        console.error('Notice: Could not auto-record referral record:', refErr.message);
+      }
+    }
+
     const newApplication = await Application.create(applicationData);
     console.log(`Application saved successfully: ${newApplication.applicationId}`);
 
@@ -350,7 +442,7 @@ const createApplication = async (req, res) => {
  */
 const getApplications = async (req, res) => {
   try {
-    const applications = await Application.find().sort({ createdAt: -1 });
+    const applications = await Application.find().sort({ createdAt: -1 }).lean();
     return res.status(200).json({
       success: true,
       count: applications.length,
@@ -535,31 +627,7 @@ const updateApplicationStatus = async (req, res) => {
       application.credentialsEmailStatus = 'pending';
       await application.save();
 
-      // 5. Dispatch Credentials Email via Nodemailer
-      let emailSent = false;
-      let emailError = null;
-      try {
-        const emailResult = await sendCredentialsEmail({
-          email: email.toLowerCase().trim(),
-          name,
-          applicationId: application.applicationId || application._id.toString(),
-          memberId,
-          tempPassword,
-        });
-
-        emailSent = emailResult.success === true;
-        if (!emailSent && emailResult.error) {
-          emailError = emailResult.error;
-        }
-      } catch (mailErr) {
-        console.error(`Credentials email failed: ${mailErr.message}`);
-        emailError = mailErr.message;
-      }
-
-      application.credentialsEmailStatus = emailSent ? 'sent' : 'failed';
-      await application.save();
-
-      // 6. Save into dedicated members collection in MongoDB Atlas strictly keyed by applicationId
+      // 5. Save into dedicated members collection in MongoDB Atlas strictly keyed by applicationId
       let savedMember;
       try {
         savedMember = await Member.findOneAndUpdate(
@@ -581,7 +649,7 @@ const updateApplicationStatus = async (req, res) => {
               totalContribution: application.membershipDetails?.totalContribution || 200,
               status: 'active',
               joiningDate: application.reviewedAt || new Date(),
-              credentialsEmailStatus: application.credentialsEmailStatus,
+              credentialsEmailStatus: 'pending',
               personalDetails: application.personalDetails || {},
               contactDetails: application.contactDetails || {},
               addressDetails: application.addressDetails || {},
@@ -597,7 +665,7 @@ const updateApplicationStatus = async (req, res) => {
         console.error('Error saving Member collection record:', memberColErr.message);
       }
 
-      // 7. Save into dedicated payments collection in MongoDB Atlas strictly keyed by applicationId
+      // 6. Save into dedicated payments collection in MongoDB Atlas strictly keyed by applicationId
       let savedPayment;
       try {
         const appId = application.applicationId || application._id.toString();
@@ -650,7 +718,58 @@ const updateApplicationStatus = async (req, res) => {
         console.error('Error saving Payment collection record:', payErr.message);
       }
 
-      // 8. Sanitized Member & Payment Response
+      // 7. Auto-convert any matching Referral in MongoDB to 'Converted'
+      try {
+        await Referral.updateMany(
+          {
+            $or: [
+              ...(application.referralId ? [{ referralId: application.referralId }] : []),
+              { mobile: mobile },
+              { email: email.toLowerCase().trim() },
+            ],
+            status: { $ne: 'Converted' },
+          },
+          {
+            $set: {
+              status: 'Converted',
+              convertedAt: new Date(),
+              notes: `Converted upon statutory approval as Member ${memberId}`,
+            },
+          }
+        );
+      } catch (refConvErr) {
+        console.error('Notice on referral conversion:', refConvErr.message);
+      }
+
+      // 8. Dispatch Credentials Email via Nodemailer ASYNCHRONOUSLY in the background
+      // This ensures the Admin Dashboard gets an immediate response (<300ms) without waiting for SMTP network handshake.
+      const appIdString = application.applicationId || application._id.toString();
+      const targetAppId = application._id;
+      const targetEmail = email.toLowerCase().trim();
+
+      setImmediate(async () => {
+        try {
+          console.log(`[Email Dispatch] Triggering background credentials email for ${memberId} (${targetEmail})...`);
+          const emailResult = await sendCredentialsEmail({
+            email: targetEmail,
+            name,
+            applicationId: appIdString,
+            memberId,
+            tempPassword,
+          });
+
+          const finalStatus = emailResult && emailResult.success === true ? 'sent' : 'failed';
+          await Application.updateOne({ _id: targetAppId }, { $set: { credentialsEmailStatus: finalStatus } }).catch(() => {});
+          await Member.updateOne({ applicationId: targetAppId }, { $set: { credentialsEmailStatus: finalStatus } }).catch(() => {});
+          console.log(`[Email Dispatch] Status for member ${memberId}: ${finalStatus}`);
+        } catch (mailErr) {
+          console.error(`[Email Dispatch] Background email failed for ${memberId}:`, mailErr.message);
+          await Application.updateOne({ _id: targetAppId }, { $set: { credentialsEmailStatus: 'failed' } }).catch(() => {});
+          await Member.updateOne({ applicationId: targetAppId }, { $set: { credentialsEmailStatus: 'failed' } }).catch(() => {});
+        }
+      });
+
+      // 8. Sanitized Member & Payment Response returned immediately
       const memberResponse = {
         _id: savedMember?._id || userDoc?._id,
         memberId,
@@ -665,16 +784,13 @@ const updateApplicationStatus = async (req, res) => {
 
       return res.status(200).json({
         success: true,
-        message: emailSent
-          ? 'Application approved, member account and payment ledger record created successfully. Credentials emailed to applicant.'
-          : 'Application approved, member account and payment ledger record created successfully.',
+        message: 'Application approved, member account and payment ledger record created successfully. Credentials email dispatched.',
         applicationId: application.applicationId || application._id.toString(),
         memberId,
         paymentId: savedPayment?.paymentId,
         payment: savedPayment,
-        emailSent,
-        emailError: emailError || undefined,
-        credentialsEmailStatus: application.credentialsEmailStatus,
+        emailSent: true,
+        credentialsEmailStatus: application.credentialsEmailStatus || 'pending',
         application,
         member: memberResponse,
       });
@@ -1048,6 +1164,44 @@ const updateApplication = async (req, res) => {
           },
           { $set: { status: 'suspended' } }
         );
+
+        // Update matching Referral to Rejected
+        await Referral.updateMany(
+          {
+            $or: [
+              ...(application.referralId ? [{ referralId: application.referralId }] : []),
+              ...(application.contactDetails?.mobile ? [{ mobile: application.contactDetails.mobile }] : []),
+              ...(applicantEmail ? [{ email: applicantEmail }] : []),
+            ],
+          },
+          {
+            $set: {
+              status: 'Rejected',
+              notes: updateData.rejectionReason || 'Application rejected by Admin',
+            },
+          }
+        ).catch(() => {});
+      } else if (newStatus === 'approved') {
+        const applicantEmail = (application.contactDetails?.email || application.email || '').toLowerCase().trim();
+        const applicantMobile = application.contactDetails?.mobile || application.mobile || '';
+
+        await Referral.updateMany(
+          {
+            $or: [
+              ...(application.referralId ? [{ referralId: application.referralId }] : []),
+              ...(applicantMobile ? [{ mobile: applicantMobile }] : []),
+              ...(applicantEmail ? [{ email: applicantEmail }] : []),
+            ],
+            status: { $ne: 'Converted' },
+          },
+          {
+            $set: {
+              status: 'Converted',
+              convertedAt: new Date(),
+              notes: 'Application approved by Admin / District',
+            },
+          }
+        ).catch(() => {});
       }
     }
 
@@ -1162,61 +1316,54 @@ const uploadDocuments = async (req, res) => {
  */
 const getApplicationDocuments = async (req, res) => {
   try {
-    const applications = await Application.find().sort({ createdAt: -1 });
+    const applications = await Application.find(
+      {},
+      '_id applicationId memberId applicantName personalDetails contactDetails status submittedAt createdAt documentDetails documents'
+    ).sort({ createdAt: -1 }).lean();
 
     const documentsData = applications.map((app) => {
       const p = app.personalDetails || {};
       const c = app.contactDetails || {};
-      const rawDoc = app.documentDetails || app.documents || {};
-      const doc = typeof rawDoc.toObject === 'function' ? rawDoc.toObject() : rawDoc;
+      const doc = app.documentDetails || app.documents || {};
 
       const nameParts = [p.title, p.firstName, p.middleName, p.lastName].filter(Boolean);
-      const applicantName = nameParts.length > 0 ? nameParts.join(' ') : 'Applicant';
+      const applicantName = nameParts.length > 0 ? nameParts.join(' ') : app.applicantName || 'Applicant';
 
       const resolvedIdUrl =
         doc.idProofUrl ||
-        doc.idProofFile ||
         doc.idProof ||
         doc.doc2_govId ||
+        doc.idProofFile ||
         app.idProofUrl ||
-        app.doc2_govId ||
-        app.idProof ||
-        (typeof doc.idProofFile === 'string' ? doc.idProofFile : '') ||
-        (typeof app.idProofFile === 'string' ? app.idProofFile : '') ||
         '';
 
       const resolvedAddrUrl =
         doc.addressProofUrl ||
-        doc.addressProofFile ||
         doc.addressProof ||
+        doc.doc3_addressProof ||
+        doc.addressProofFile ||
         app.addressProofUrl ||
-        app.addressProof ||
-        (typeof doc.addressProofFile === 'string' ? doc.addressProofFile : '') ||
-        (typeof app.addressProofFile === 'string' ? app.addressProofFile : '') ||
         '';
 
       const resolvedPhotoUrl =
         doc.photoUrl ||
-        doc.photoFile ||
         doc.photo ||
         doc.doc1_photo ||
+        doc.photoFile ||
         app.photoUrl ||
-        app.doc1_photo ||
-        (typeof doc.photoFile === 'string' ? doc.photoFile : '') ||
-        (typeof app.photoFile === 'string' ? app.photoFile : '') ||
         '';
 
       const resolvedSigUrl =
         doc.signatureUrl ||
-        doc.signatureFile ||
         doc.signature ||
+        doc.doc4_signature ||
+        doc.signatureFile ||
         app.signatureUrl ||
-        (typeof doc.signatureFile === 'string' ? doc.signatureFile : '') ||
-        (typeof app.signatureFile === 'string' ? app.signatureFile : '') ||
         '';
 
       const resolvedDoc3Url =
         doc.doc3_eduCert ||
+        doc.doc3_eduCertFile ||
         app.doc3_eduCert ||
         (Array.isArray(doc.additionalDocuments)
           ? doc.additionalDocuments.find(d => d.documentType === 'Educational Certificate')?.documentUrl
@@ -1225,6 +1372,7 @@ const getApplicationDocuments = async (req, res) => {
 
       const resolvedDoc4Url =
         doc.doc4_birthCert ||
+        doc.doc4_birthCertFile ||
         app.doc4_birthCert ||
         (Array.isArray(doc.additionalDocuments)
           ? doc.additionalDocuments.find(d => d.documentType === 'Birth / PAN Certificate' || d.documentType === 'Birth Certificate')?.documentUrl
@@ -1233,6 +1381,7 @@ const getApplicationDocuments = async (req, res) => {
 
       const resolvedDoc5Url =
         doc.doc5_utility ||
+        doc.doc5_utilityFile ||
         app.doc5_utility ||
         (Array.isArray(doc.additionalDocuments)
           ? doc.additionalDocuments.find(d => d.documentType === 'Financial / Utility Document' || d.documentType === 'Utility Bill')?.documentUrl
@@ -1249,21 +1398,14 @@ const getApplicationDocuments = async (req, res) => {
         status: app.status || 'pending',
         submittedAt: app.submittedAt || app.createdAt,
 
-        // Complete documentDetails object from MongoDB schema
+        // Clean documentDetails without redundant duplicates
         documentDetails: {
           idProofType: doc.idProofType || app.idProofType || 'Aadhaar Card',
           idProofUrl: resolvedIdUrl,
-          idProofFile: resolvedIdUrl,
-          idProof: resolvedIdUrl,
-          doc2_govId: resolvedIdUrl,
           addressProofType: doc.addressProofType || app.addressProofType || 'Aadhaar Card',
           addressProofUrl: resolvedAddrUrl,
-          addressProofFile: resolvedAddrUrl,
-          addressProof: resolvedAddrUrl,
           photoUrl: resolvedPhotoUrl,
-          photoFile: resolvedPhotoUrl,
           signatureUrl: resolvedSigUrl,
-          signatureFile: resolvedSigUrl,
           doc3_eduCert: resolvedDoc3Url,
           doc4_birthCert: resolvedDoc4Url,
           doc5_utility: resolvedDoc5Url,
@@ -1589,6 +1731,88 @@ const serveDocumentFile = (req, res) => {
   }
 };
 
+/**
+ * @desc    Delete an application (supports rejected and pending applications)
+ * @route   DELETE /api/applications/:id
+ * @access  Private (Admin)
+ */
+const deleteApplication = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id) {
+      return res.status(400).json({ success: false, message: 'Application ID is required' });
+    }
+
+    let application = null;
+    if (mongoose.Types.ObjectId.isValid(id)) {
+      application = await Application.findById(id);
+    }
+    if (!application) {
+      application = await Application.findOne({ applicationId: id });
+    }
+    if (!application) {
+      application = await Application.findOne({ applicationNumber: id });
+    }
+
+    if (!application) {
+      return res.status(404).json({ success: false, message: 'Application not found' });
+    }
+
+    // Safety guard: Protect approved members from accidental deletion
+    if (application.status === 'approved') {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot delete an Approved member application directly. Please suspend or revoke membership first.',
+      });
+    }
+
+    const appId = application._id;
+    const appStrId = application.applicationId;
+
+    // Clean up any associated payment records linked to this application
+    await Payment.deleteMany({
+      $or: [
+        { applicationId: appId },
+        ...(appStrId ? [{ applicationRefId: appStrId }] : []),
+      ],
+    }).catch((err) => console.warn('Payment delete notice:', err.message));
+
+    // Clean up any referral records linked to this application
+    await Referral.deleteMany({
+      $or: [
+        { applicationId: appId },
+        ...(appStrId ? [{ applicationId: appStrId }] : []),
+        ...(application.mobile ? [{ referredUserMobile: application.mobile }] : []),
+      ],
+    }).catch((err) => console.warn('Referral delete notice:', err.message));
+
+    // Remove any orphaned Member documents created during sync (except active members)
+    await Member.deleteMany({
+      $or: [
+        { applicationId: appId },
+        ...(appStrId ? [{ applicationRefId: appStrId }, { memberId: appStrId }] : []),
+      ],
+      status: { $ne: 'active' },
+    }).catch((err) => console.warn('Member delete notice:', err.message));
+
+    // Delete the application document from MongoDB
+    await Application.deleteOne({ _id: appId });
+
+    return res.status(200).json({
+      success: true,
+      message: `Application ${appStrId || id} was deleted successfully.`,
+      deletedId: appId,
+      applicationId: appStrId,
+    });
+  } catch (error) {
+    console.error('Error deleting application:', error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to delete application',
+    });
+  }
+};
+
 module.exports = {
   createApplication,
   getApplications,
@@ -1598,6 +1822,7 @@ module.exports = {
   uploadDocuments,
   resendMemberCredentials,
   serveDocumentFile,
+  deleteApplication,
 };
 
 

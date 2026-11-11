@@ -162,8 +162,8 @@ const applicationSchema = new mongoose.Schema(
       },
       credentialsEmailStatus: {
         type: String,
-        enum: ['pending', 'sent', 'failed'],
         default: 'pending',
+        trim: true,
       },
     },
     {

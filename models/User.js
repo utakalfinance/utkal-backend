@@ -29,10 +29,28 @@ const userSchema = new mongoose.Schema(
       type: String,
       required: [true, 'Password is required'],
     },
+    username: {
+      type: String,
+      unique: true,
+      sparse: true,
+      trim: true,
+      lowercase: true,
+    },
     role: {
       type: String,
-      enum: ['admin', 'member'],
+      enum: ['admin', 'super_admin', 'district_admin', 'member'],
       default: 'member',
+    },
+    districtId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'District',
+      default: null,
+      index: true,
+    },
+    assignedDistrict: {
+      type: String,
+      trim: true,
+      default: '',
     },
     status: {
       type: String,

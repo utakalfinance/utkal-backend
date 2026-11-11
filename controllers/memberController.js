@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const Application = require('../models/Application');
 const User = require('../models/User');
 const Member = require('../models/Member');
+const LoanEnquiry = require('../models/LoanEnquiry');
 const { generateMemberId } = require('../utils/memberIdGenerator');
 
 /**
@@ -136,6 +137,7 @@ const formatMemberRecord = (memberDoc) => {
     personalDetails: p,
     contactDetails: c,
     addressDetails: a,
+    district: a.district || a.commDistrict || m.district || '',
     nomineeDetails: n,
     membershipDetails: mem,
     documentDetails: doc,
@@ -151,16 +153,19 @@ const formatMemberRecord = (memberDoc) => {
  */
 const getMembers = async (req, res) => {
   try {
-    // 1. Sync any approved application that might be missing a Member document in MongoDB
-    const approvedApps = await Application.find({ status: 'approved' });
-    for (const app of approvedApps) {
-      const existingMember = await Member.findOne({ applicationId: app._id });
-      if (!existingMember) {
+    // 1. Fast check: find any approved application missing a Member document in MongoDB
+    const existingMembers = await Member.find({}, 'applicationId').lean();
+    const existingMemberAppIds = new Set(existingMembers.map((m) => String(m.applicationId)));
+
+    const approvedApps = await Application.find({ status: 'approved' }).lean();
+    const missingApps = approvedApps.filter((app) => !existingMemberAppIds.has(String(app._id)));
+
+    if (missingApps.length > 0) {
+      for (const app of missingApps) {
         let memberId = app.memberId;
         if (!memberId || !memberId.startsWith('NUF-M-')) {
           memberId = await generateMemberId();
-          app.memberId = memberId;
-          await app.save();
+          await Application.updateOne({ _id: app._id }, { $set: { memberId } });
         }
 
         const p = app.personalDetails || {};
@@ -203,7 +208,7 @@ const getMembers = async (req, res) => {
     }
 
     // 1b. Sync rejected applications so their Member records are marked suspended
-    const rejectedApps = await Application.find({ status: 'rejected' }, '_id memberId');
+    const rejectedApps = await Application.find({ status: 'rejected' }, '_id memberId').lean();
     if (rejectedApps.length > 0) {
       const rejectedAppIds = rejectedApps.map((a) => a._id);
       const rejectedMemberIds = rejectedApps.map((a) => a.memberId).filter(Boolean);
@@ -219,8 +224,8 @@ const getMembers = async (req, res) => {
       );
     }
 
-    // 2. Fetch directly from the real Member collection in MongoDB
-    const membersFromDb = await Member.find().sort({ createdAt: -1 });
+    // 2. Fetch directly from the real Member collection in MongoDB with lean()
+    const membersFromDb = await Member.find().sort({ createdAt: -1 }).lean();
     const membersList = membersFromDb.map(formatMemberRecord);
 
     return res.status(200).json({
@@ -386,8 +391,323 @@ const updateMemberStatus = async (req, res) => {
   }
 };
 
+/**
+ * @desc    Get loan overview for authenticated member
+ * @route   GET /api/members/loan-overview
+ * @access  Private (Protected Member)
+ */
+const getMemberLoanOverview = async (req, res) => {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: 'Unauthorized: Member session required',
+      });
+    }
+
+    const memberId = user.memberId;
+    const isValidObjectId = mongoose.Types.ObjectId.isValid(user._id);
+
+    // Look up real member and application record from MongoDB
+    const [member, application] = await Promise.all([
+      Member.findOne({
+        $or: [
+          ...(memberId ? [{ memberId }] : []),
+          ...(user.applicationId ? [{ applicationId: user.applicationId }] : []),
+          ...(isValidObjectId ? [{ userId: user._id }] : []),
+        ],
+      }),
+      user.applicationId
+        ? Application.findById(user.applicationId)
+        : (memberId ? Application.findOne({ memberId }) : null),
+    ]);
+
+    // Check member approval status
+    const isApproved = member?.status === 'active' || application?.status === 'approved';
+    if (!isApproved) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only approved statutory members can access member loan services.',
+      });
+    }
+
+    // Active loan records (currently no active loan records)
+    const activeLoanAmount = 0;
+    const outstandingBalance = 0;
+    const totalRepaid = 0;
+    const currentLoanStatus = 'No Active Loan';
+    const nextLoanEligibility = 'Locked (Requires full repayment and verification of first ₹10,000 loan within 2 months)';
+
+    const overviewData = {
+      member: {
+        memberId: member?.memberId || user.memberId || '—',
+        name: member?.name || user.name || 'Valued Member',
+        email: member?.email || user.email,
+        mobile: member?.mobile || user.mobile,
+        membershipType: member?.membershipType || 'Associate Member',
+        status: member?.status || 'active',
+        isApprovedMember: true,
+      },
+      firstLoanOffer: {
+        amount: 10000,
+        formattedAmount: '₹10,000',
+        interestRate: 5,
+        interestRateDisplay: '5%',
+        repaymentPeriod: 'Within 2 Months',
+        tenureMonths: 2,
+        purpose: 'Statutory Member Introductory Credit Facility',
+        terms: 'Mandatory full repayment within two (2) calendar months to unlock subsequent loan tiers',
+      },
+      loanSummary: {
+        activeLoanAmount,
+        formattedActiveLoanAmount: '₹0',
+        outstandingBalance,
+        formattedOutstandingBalance: '₹0',
+        totalRepaid,
+        formattedTotalRepaid: '₹0',
+        currentLoanStatus,
+        nextLoanEligibility,
+        hasApplied: false,
+        activeLoansCount: 0,
+        isNextTierEligible: false,
+      },
+      businessRules: {
+        firstLoanAmount: 10000,
+        interestRate: 5,
+        repaymentPeriodMonths: 2,
+        ruleText: 'The next loan application is unlocked only after the first loan (₹10,000) has been fully repaid and all payments have been verified within the required 2-month period.',
+        disbursementNotice: 'Statutory procedural notice: Loan application review, approval, and money disbursement operate as separate stages.',
+      },
+    };
+
+    return res.status(200).json({
+      success: true,
+      data: overviewData,
+    });
+  } catch (error) {
+    console.error('Error fetching member loan overview:', error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to fetch loan overview',
+    });
+  }
+};
+
+/**
+ * @desc    Get available loans for authenticated member
+ * @route   GET /api/members/available-loans
+ * @access  Private (Protected Member)
+ */
+const getAvailableLoans = async (req, res) => {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: 'Unauthorized: Member session required',
+      });
+    }
+
+    const availableLoans = [
+      {
+        id: 'member-loan-tier-1',
+        title: 'First Member Term Loan',
+        badge: 'FIRST LOAN OFFER',
+        tier: 'Tier 1 (First Member Loan)',
+        amount: 10000,
+        formattedAmount: '₹10,000',
+        interestRate: '5%',
+        interestRateValue: 5,
+        repaymentPeriod: 'Within 2 Months',
+        tenureMonths: 2,
+        status: 'available',
+        isLocked: false,
+        category: 'Statutory Member Privilege',
+        description: 'Exclusive introductory loan facility designed for approved statutory members of New Utkal Finance Ltd.',
+        eligibilityConditions: [
+          'Approved statutory membership of New Utkal Finance Ltd.',
+          'Active membership status with verified share capital contribution',
+          'Completed KYC verification (Aadhaar Card, PAN Card, Photo and Signature on record)',
+          'No delinquent or outstanding prior dues',
+        ],
+        repaymentGuidelines: [
+          'Fixed interest rate: 5%',
+          'Repayment timeline: Full repayment must happen within two (2) months',
+          'Approval & Disbursement: Loan evaluation, approval, and funds disbursement operate as separate formal stages',
+          'Progression rule: The next loan tier is unlocked only after this first loan is fully repaid and verified',
+        ],
+      },
+      {
+        id: 'member-loan-tier-2',
+        title: 'Tier 2 Member Expansion Loan',
+        badge: 'LOCKED TIER',
+        tier: 'Tier 2',
+        amount: 25000,
+        formattedAmount: '₹25,000',
+        interestRate: '5%',
+        interestRateValue: 5,
+        repaymentPeriod: 'Within 3 - 6 Months',
+        tenureMonths: 6,
+        status: 'locked',
+        isLocked: true,
+        category: 'Statutory Member Privilege',
+        description: 'Higher credit tier unlocked exclusively for members with flawless repayment records.',
+        lockReason: 'Unlocked only after your first loan of ₹10,000 has been fully repaid and verified within the required 2-month period.',
+        eligibilityConditions: [
+          '100% timely repayment of First Member Loan (₹10,000) within 2 months',
+          'Ledger and audit reconciliation completed by branch administrator',
+        ],
+      },
+      {
+        id: 'member-loan-tier-3',
+        title: 'Tier 3 Business & Personal Growth Loan',
+        badge: 'LOCKED TIER',
+        tier: 'Tier 3',
+        amount: 50000,
+        formattedAmount: '₹50,000',
+        interestRate: '5%',
+        interestRateValue: 5,
+        repaymentPeriod: 'Within 6 - 12 Months',
+        tenureMonths: 12,
+        status: 'locked',
+        isLocked: true,
+        category: 'Statutory Member Privilege',
+        description: 'Advanced credit tier for long-standing cooperative members.',
+        lockReason: 'Unlocked only upon successful completion and verification of Tier 1 and Tier 2 loans.',
+        eligibilityConditions: [
+          'Completion of Tier 1 & Tier 2 repayment cycles',
+          'Minimum 6 months active cooperative membership',
+        ],
+      },
+    ];
+
+    return res.status(200).json({
+      success: true,
+      data: availableLoans,
+    });
+  } catch (error) {
+    console.error('Error fetching available loans:', error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to fetch available loans',
+    });
+  }
+};
+
+/**
+ * @desc    Get loan history for authenticated member from MongoDB
+ * @route   GET /api/members/loan-history
+ * @access  Private (Protected Member)
+ */
+const getMemberLoanHistory = async (req, res) => {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: 'Unauthorized: Member session required',
+      });
+    }
+
+    const memberId = user.memberId;
+    const userEmail = (user.email || '').toLowerCase().trim();
+    const userMobile = (user.mobile || '').trim();
+    const isValidObjectId = mongoose.Types.ObjectId.isValid(user._id);
+
+    // 1. Resolve member record from MongoDB
+    const [memberDoc, appDoc] = await Promise.all([
+      Member.findOne({
+        $or: [
+          ...(memberId ? [{ memberId }] : []),
+          ...(user.applicationId ? [{ applicationId: user.applicationId }] : []),
+          ...(isValidObjectId ? [{ userId: user._id }] : []),
+          ...(userEmail ? [{ email: userEmail }] : []),
+        ],
+      }),
+      user.applicationId
+        ? Application.findById(user.applicationId)
+        : (memberId ? Application.findOne({ memberId }) : null),
+    ]);
+
+    // Ensure member is approved and active
+    const isApproved = memberDoc?.status === 'active' || appDoc?.status === 'approved';
+    if (!isApproved) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only approved statutory members can access member loan history.',
+      });
+    }
+
+    const resolvedMemberId = memberDoc?.memberId || user.memberId || '—';
+    const resolvedEmail = (memberDoc?.email || userEmail).toLowerCase().trim();
+    const resolvedMobile = (memberDoc?.mobile || userMobile).trim();
+
+    // 2. Query actual MongoDB loan records for THIS member only (scoped to this member)
+    const queryConditions = [];
+    if (resolvedEmail) queryConditions.push({ email: resolvedEmail });
+    if (resolvedMobile) queryConditions.push({ mobileNumber: resolvedMobile });
+
+    let loanRecords = [];
+    if (queryConditions.length > 0) {
+      const enquiries = await LoanEnquiry.find({ $or: queryConditions }).sort({ createdAt: -1 });
+
+      loanRecords = enquiries.map((enq) => {
+        const isConverted = enq.status === 'Converted';
+        const isClosed = enq.status === 'Closed';
+
+        return {
+          id: enq.enquiryId || enq._id.toString(),
+          loanId: enq.enquiryId || `LN-${enq._id.toString().slice(-6).toUpperCase()}`,
+          category: enq.loanCategory || 'Member Term Loan',
+          loanAmount: enq.expectedAmount || 10000,
+          formattedLoanAmount: enq.expectedAmount ? `₹${Number(enq.expectedAmount).toLocaleString('en-IN')}` : '₹10,000',
+          interestRate: '5%',
+          applicationDate: formatDate(enq.submittedAt || enq.createdAt),
+          approvalDate: enq.convertedAt ? formatDate(enq.convertedAt) : (isConverted ? formatDate(enq.updatedAt) : '—'),
+          disbursementDate: isConverted ? formatDate(enq.convertedAt || enq.updatedAt) : '—',
+          repaymentDeadline: isConverted && enq.convertedAt
+            ? formatDate(new Date(new Date(enq.convertedAt).getTime() + 60 * 24 * 60 * 60 * 1000))
+            : 'Within 2 Months',
+          totalRepaid: '₹0',
+          outstandingBalance: isConverted
+            ? (enq.expectedAmount ? `₹${Number(enq.expectedAmount).toLocaleString('en-IN')}` : '₹10,000')
+            : '₹0',
+          loanStatus: isConverted
+            ? 'Active'
+            : isClosed
+            ? 'Rejected'
+            : enq.status === 'Contacted' || enq.status === 'Membership Registration Informed'
+            ? 'Under Review'
+            : 'Pending Approval',
+          rawStatus: enq.status,
+          adminRemarks: enq.adminRemarks || '',
+        };
+      });
+    }
+
+    // Return strictly actual records from MongoDB (0 if member hasn't applied)
+    return res.status(200).json({
+      success: true,
+      memberId: resolvedMemberId,
+      count: loanRecords.length,
+      data: loanRecords,
+    });
+  } catch (error) {
+    console.error('Error fetching member loan history:', error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to fetch loan history',
+    });
+  }
+};
+
 module.exports = {
   getMembers,
   getMemberById,
   updateMemberStatus,
+  getMemberLoanOverview,
+  getAvailableLoans,
+  getMemberLoanHistory,
 };
+

@@ -9,17 +9,17 @@ const User = require('../models/User');
 async function generateMemberId() {
   let maxNum = 0;
 
-  // Search existing members, users and applications with NUF-M-XXXX format
-  const [membersWithId, usersWithMemberId, appsWithMemberId] = await Promise.all([
-    Member.find({ memberId: /^NUF-M-\d+$/ }).select('memberId').lean(),
-    User.find({ memberId: /^NUF-M-\d+$/ }).select('memberId').lean(),
-    Application.find({ memberId: /^NUF-M-\d+$/ }).select('memberId').lean(),
+  // Search existing highest members, users and applications with NUF-M-XXXX format
+  const [lastMembers, lastUsers, lastApps] = await Promise.all([
+    Member.find({ memberId: /^NUF-M-\d+$/ }).sort({ memberId: -1 }).limit(10).select('memberId').lean(),
+    User.find({ memberId: /^NUF-M-\d+$/ }).sort({ memberId: -1 }).limit(10).select('memberId').lean(),
+    Application.find({ memberId: /^NUF-M-\d+$/ }).sort({ memberId: -1 }).limit(10).select('memberId').lean(),
   ]);
 
   const allMemberIds = [
-    ...membersWithId.map((m) => m.memberId),
-    ...usersWithMemberId.map((u) => u.memberId),
-    ...appsWithMemberId.map((a) => a.memberId),
+    ...(lastMembers || []).map((m) => m.memberId),
+    ...(lastUsers || []).map((u) => u.memberId),
+    ...(lastApps || []).map((a) => a.memberId),
   ].filter(Boolean);
 
   allMemberIds.forEach((idStr) => {
@@ -35,12 +35,12 @@ async function generateMemberId() {
   let candidateId = '';
   let attempts = 0;
 
-  while (!isUnique && attempts < 100) {
+  while (!isUnique && attempts < 20) {
     candidateId = `NUF-M-${String(nextNumber).padStart(4, '0')}`;
     const [existingMember, existingUser, existingApp] = await Promise.all([
-      Member.findOne({ memberId: candidateId }).lean(),
-      User.findOne({ memberId: candidateId }).lean(),
-      Application.findOne({ memberId: candidateId }).lean(),
+      Member.findOne({ memberId: candidateId }).select('_id').lean(),
+      User.findOne({ memberId: candidateId }).select('_id').lean(),
+      Application.findOne({ memberId: candidateId }).select('_id').lean(),
     ]);
 
     if (!existingMember && !existingUser && !existingApp) {

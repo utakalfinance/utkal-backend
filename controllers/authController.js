@@ -15,9 +15,12 @@ const generateToken = (user) => {
   return jwt.sign(
     {
       id: user._id,
-      role: user.role,
+      role: user.role === 'admin' ? 'super_admin' : user.role,
       memberId: user.memberId,
+      username: user.username,
       email: user.email,
+      districtId: user.districtId || null,
+      assignedDistrict: user.assignedDistrict || null,
     },
     env.JWT_SECRET,
     { expiresIn: env.JWT_EXPIRES_IN }
@@ -59,9 +62,9 @@ const loginUser = async (req, res) => {
     if (isEmailAdmin && isPassAdmin) {
       const adminPayload = {
         _id: 'admin-root',
-        name: 'Administrator',
+        name: 'Super Administrator',
         email: cleanId.includes('@') ? cleanId : adminEmail,
-        role: 'admin',
+        role: 'super_admin',
         status: 'active',
         mustChangePassword: false,
       };
@@ -69,9 +72,9 @@ const loginUser = async (req, res) => {
 
       return res.status(200).json({
         success: true,
-        message: 'Admin login successful',
+        message: 'Super Admin login successful',
         token,
-        role: 'admin',
+        role: 'super_admin',
         user: adminPayload,
         application: null,
       });
@@ -79,10 +82,11 @@ const loginUser = async (req, res) => {
 
     const idRegex = new RegExp(`^${escapeRegex(loginId)}$`, 'i');
 
-    // 1. Find user by Member ID, Email, or Mobile
+    // 1. Find user by Member ID, Username, Email, or Mobile
     let user = await User.findOne({
       $or: [
         { memberId: idRegex },
+        { username: idRegex },
         { email: cleanId },
         { mobile: loginId },
       ],
@@ -150,37 +154,39 @@ const loginUser = async (req, res) => {
       });
     }
 
-    // Always verify the applicant's linked application status
-    if (!linkedApp) {
-      linkedApp = user.applicationId
-        ? await Application.findById(user.applicationId)
-        : (user.memberId
-            ? await Application.findOne({ memberId: user.memberId })
-            : await Application.findOne({
-                $or: [
-                  { 'contactDetails.email': user.email },
-                  { email: user.email },
-                  ...(user.mobile ? [{ 'contactDetails.mobile': user.mobile }, { mobile: user.mobile }] : []),
-                ],
-              }));
-    }
-
-    if (linkedApp && linkedApp.status === 'rejected') {
-      if (user.status === 'active') {
-        user.status = 'inactive';
-        await user.save().catch(() => {});
+    // Verify applicant's linked application status strictly for members
+    if (user.role === 'member') {
+      if (!linkedApp) {
+        linkedApp = user.applicationId
+          ? await Application.findById(user.applicationId)
+          : (user.memberId
+              ? await Application.findOne({ memberId: user.memberId })
+              : await Application.findOne({
+                  $or: [
+                    { 'contactDetails.email': user.email },
+                    { email: user.email },
+                    ...(user.mobile ? [{ 'contactDetails.mobile': user.mobile }, { mobile: user.mobile }] : []),
+                  ],
+                }));
       }
-      return res.status(403).json({
-        success: false,
-        message: 'Your membership application has been rejected by the administrator. Access to the Member Dashboard is not permitted.',
-      });
-    }
 
-    if (linkedApp && linkedApp.status === 'pending') {
-      return res.status(403).json({
-        success: false,
-        message: 'Your membership application is currently pending admin approval. You will receive an email once approved.',
-      });
+      if (linkedApp && linkedApp.status === 'rejected') {
+        if (user.status === 'active') {
+          user.status = 'inactive';
+          await user.save().catch(() => {});
+        }
+        return res.status(403).json({
+          success: false,
+          message: 'Your membership application has been rejected by the administrator. Access to the Member Dashboard is not permitted.',
+        });
+      }
+
+      if (linkedApp && linkedApp.status === 'pending') {
+        return res.status(403).json({
+          success: false,
+          message: 'Your membership application is currently pending admin approval. You will receive an email once approved.',
+        });
+      }
     }
 
     if (user.status !== 'active') {
@@ -206,55 +212,70 @@ const loginUser = async (req, res) => {
     // Generate JWT token
     const token = generateToken(user);
 
-    // Fetch linked member, application, and payments details
-    const [memberData, applicationData, paymentDocs] = await Promise.all([
-      Member.findOne({
-        $or: [
-          ...(user.memberId ? [{ memberId: user.memberId }] : []),
-          ...(user.applicationId ? [{ applicationId: user.applicationId }] : []),
-          { userId: user._id },
-        ],
-      }),
-      user.applicationId
-        ? Application.findById(user.applicationId)
-        : (user.memberId ? Application.findOne({ memberId: user.memberId }) : null),
-      Payment.find({
-        $or: [
-          ...(user.memberId ? [{ memberId: user.memberId }] : []),
-          ...(user.applicationId ? [{ applicationId: user.applicationId }] : []),
-        ],
-      }).sort({ createdAt: -1 }),
-    ]);
+    // Fetch linked member, application, and payments details (only for members)
+    let memberData = null;
+    let applicationData = null;
+    let formattedPayments = [];
 
-    const formattedPayments = (paymentDocs || []).map((p) => ({
-      id: p.paymentId,
-      paymentId: p.paymentId,
-      memberId: p.memberId || user.memberId,
-      memberName: p.memberName || user.name,
-      amount: p.amount,
-      purpose: p.purpose,
-      paymentMethod: p.paymentMethod,
-      method: p.paymentMethod,
-      status: p.status === 'paid' ? 'Paid' : (p.status === 'refunded' ? 'Refunded' : 'Pending'),
-      date: p.date ? new Date(p.date).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : 'N/A',
-      utrNo: p.utrNo,
-      transactionId: p.transactionId || p.paymentId,
-      receiptUrl: p.receiptUrl,
-      notes: p.notes,
-    }));
+    if (user.role === 'member') {
+      const [m, a, pDocs] = await Promise.all([
+        Member.findOne({
+          $or: [
+            ...(user.memberId ? [{ memberId: user.memberId }] : []),
+            ...(user.applicationId ? [{ applicationId: user.applicationId }] : []),
+            { userId: user._id },
+          ],
+        }),
+        user.applicationId
+          ? Application.findById(user.applicationId)
+          : (user.memberId ? Application.findOne({ memberId: user.memberId }) : null),
+        (user.memberId || user.applicationId)
+          ? Payment.find({
+              $or: [
+                ...(user.memberId ? [{ memberId: user.memberId }] : []),
+                ...(user.applicationId ? [{ applicationId: user.applicationId }] : []),
+              ],
+            }).sort({ createdAt: -1 })
+          : Promise.resolve([]),
+      ]);
+
+      memberData = m;
+      applicationData = a;
+      formattedPayments = (pDocs || []).map((p) => ({
+        id: p.paymentId,
+        paymentId: p.paymentId,
+        memberId: p.memberId || user.memberId,
+        memberName: p.memberName || user.name,
+        amount: p.amount,
+        purpose: p.purpose,
+        paymentMethod: p.paymentMethod,
+        method: p.paymentMethod,
+        status: p.status === 'paid' ? 'Paid' : (p.status === 'refunded' ? 'Refunded' : 'Pending'),
+        date: p.date ? new Date(p.date).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : 'N/A',
+        utrNo: p.utrNo,
+        transactionId: p.transactionId || p.paymentId,
+        receiptUrl: p.receiptUrl,
+        notes: p.notes,
+      }));
+    }
+
+    const resolvedRole = user.role === 'admin' ? 'super_admin' : (user.role || 'member');
 
     return res.status(200).json({
       success: true,
       message: 'Login successful',
       token,
-      role: user.role || 'member',
+      role: resolvedRole,
       user: {
         _id: user._id,
         memberId: user.memberId,
+        username: user.username,
         name: user.name,
         email: user.email,
         mobile: user.mobile,
-        role: user.role,
+        role: resolvedRole,
+        districtId: user.districtId || null,
+        assignedDistrict: user.assignedDistrict || null,
         status: user.status,
         mustChangePassword: user.mustChangePassword ?? true,
         applicationId: user.applicationId,

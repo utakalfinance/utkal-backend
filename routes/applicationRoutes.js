@@ -10,6 +10,7 @@ const {
   uploadDocuments,
   resendMemberCredentials,
   serveDocumentFile,
+  deleteApplication,
 } = require('../controllers/applicationController');
 
 // GET /api/applications/files/:filename - Stream document directly through API (bypasses static web server rewrite bugs)
@@ -30,6 +31,9 @@ router.post('/', upload.any(), createApplication);
 // PUT & PATCH /api/applications/:id - Update/Edit application details
 router.put('/:id', upload.any(), updateApplication);
 router.patch('/:id', upload.any(), updateApplication);
+
+// DELETE /api/applications/:id - Delete rejected/cancelled application
+router.delete('/:id', deleteApplication);
 
 // PATCH /api/applications/:id/status - Update application status (Admin approval)
 router.patch('/:id/status', updateApplicationStatus);

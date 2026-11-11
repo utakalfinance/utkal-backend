@@ -79,11 +79,15 @@ const formatPaymentRecord = (p) => {
  */
 const getPayments = async (req, res) => {
   try {
-    // 1. Auto-sync any approved application that doesn't have a Payment document yet
-    const approvedApps = await Application.find({ status: 'approved' });
-    for (const app of approvedApps) {
-      const existingPayment = await Payment.findOne({ applicationId: app._id });
-      if (!existingPayment) {
+    // 1. Fast check: find any approved application that doesn't have a Payment document yet
+    const existingPayments = await Payment.find({}, 'applicationId').lean();
+    const existingPaymentAppIds = new Set(existingPayments.map((p) => String(p.applicationId)));
+
+    const approvedApps = await Application.find({ status: 'approved' }).lean();
+    const missingApps = approvedApps.filter((app) => !existingPaymentAppIds.has(String(app._id)));
+
+    if (missingApps.length > 0) {
+      for (const app of missingApps) {
         const appId = app.applicationId || app._id.toString();
         const cleanDigits = appId.replace(/\D/g, '') || null;
         const paymentId = await generatePaymentId(cleanDigits);
@@ -100,7 +104,6 @@ const getPayments = async (req, res) => {
         const receiptUrl = app.paymentDetails?.receiptUrl || app.documentDetails?.paymentReceiptUrl || '';
         const receiptFileName = app.paymentDetails?.receiptFileName || 'Statutory_Payment_Receipt.png';
 
-        // Set status to 'paid' if applicant has payment confirmation / utr or approved
         const status = (app.paymentDetails?.status || 'paid').toLowerCase();
 
         await Payment.findOneAndUpdate(
@@ -140,8 +143,8 @@ const getPayments = async (req, res) => {
       }
     }
 
-    // 2. Fetch all payments directly from MongoDB
-    const paymentsFromDb = await Payment.find().sort({ createdAt: -1 });
+    // 2. Fetch all payments directly from MongoDB with lean()
+    const paymentsFromDb = await Payment.find().sort({ createdAt: -1 }).lean();
     const formatted = paymentsFromDb.map(formatPaymentRecord);
 
     return res.status(200).json({

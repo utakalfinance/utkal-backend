@@ -76,8 +76,8 @@ const memberSchema = new mongoose.Schema(
     },
     credentialsEmailStatus: {
       type: String,
-      enum: ['pending', 'sent', 'failed'],
       default: 'pending',
+      trim: true,
     },
     personalDetails: {
       title: { type: String, trim: true },

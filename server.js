@@ -58,6 +58,10 @@ const memberRoutes = require('./routes/memberRoutes');
 const paymentRoutes = require('./routes/paymentRoutes');
 const authRoutes = require('./routes/authRoutes');
 const profileUpdateRoutes = require('./routes/profileUpdateRoutes');
+const loanEnquiryRoutes = require('./routes/loanEnquiryRoutes');
+const districtRoutes = require('./routes/districtRoutes');
+const loanApplicationRoutes = require('./routes/loanApplicationRoutes');
+const districtAdminRoutes = require('./routes/districtAdminRoutes');
 
 // Health Check Route: GET /api/health
 app.get('/api/health', (req, res) => {
@@ -75,6 +79,11 @@ app.use('/api/members', memberRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/profile-updates', profileUpdateRoutes);
+app.use('/api/loan-enquiries', loanEnquiryRoutes);
+app.use('/api/enquiries', loanEnquiryRoutes);
+app.use('/api/districts', districtRoutes);
+app.use('/api/loan-applications', loanApplicationRoutes);
+app.use('/api/district-admins', districtAdminRoutes);
 
 // Serve Frontend Production Build if present on Hostinger
 const clientDistPaths = [
