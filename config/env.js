@@ -59,6 +59,13 @@ const EMAIL_PASSWORD = (process.env.EMAIL_PASSWORD || process.env.EMAIL_PASS || 
 
 const EMAIL_FROM = (process.env.EMAIL_FROM || EMAIL_USER || 'no-reply@utkalfinance.com').trim();
 
+// SMS Gateway Configuration (Supported: Fast2SMS, MSG91, Twilio, or generic webhook)
+const SMS_PROVIDER = (process.env.SMS_PROVIDER || '').trim();
+const SMS_API_KEY = (process.env.SMS_API_KEY || '').trim();
+const SMS_SENDER_ID = (process.env.SMS_SENDER_ID || 'UTKALF').trim();
+const SMS_ENTITY_ID = (process.env.SMS_ENTITY_ID || '').trim(); // DLT Entity ID for Indian Telecom regulations
+const SMS_IS_CONFIGURED = Boolean(SMS_PROVIDER && SMS_API_KEY);
+
 const env = Object.freeze({
   NODE_ENV,
   IS_PROD,
@@ -79,6 +86,13 @@ const env = Object.freeze({
     PASSWORD: EMAIL_PASSWORD,
     FROM: EMAIL_FROM,
     IS_CONFIGURED: Boolean(EMAIL_USER && EMAIL_PASSWORD),
+  }),
+  SMS: Object.freeze({
+    PROVIDER: SMS_PROVIDER,
+    API_KEY: SMS_API_KEY,
+    SENDER_ID: SMS_SENDER_ID,
+    ENTITY_ID: SMS_ENTITY_ID,
+    IS_CONFIGURED: SMS_IS_CONFIGURED,
   }),
 });
 
