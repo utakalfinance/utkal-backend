@@ -1,4 +1,6 @@
 const mongoose = require('mongoose');
+const User = require('../models/User');
+const Member = require('../models/Member');
 const Investor = require('../models/Investor');
 const InvestorPayment = require('../models/InvestorPayment');
 const InvestmentPlan = require('../models/InvestmentPlan');
@@ -317,44 +319,118 @@ const ensureDefaultPlansSeeded = async () => {
  */
 const getInvestorStats = async (req, res) => {
   try {
-    const totalInvestors = await Investor.countDocuments();
-    const verifiedInvestors = await Investor.countDocuments({ kycStatus: 'Verified' });
+    const isAssociate = req.user?.role === 'associate';
+    const filter = isAssociate
+      ? {
+          $or: [
+            { 'sourcedBy.associateId': req.user._id },
+            ...(req.user.memberId ? [{ 'sourcedBy.associateMemberId': req.user.memberId }] : []),
+            ...(req.user.email ? [{ 'sourcedBy.associateEmail': req.user.email.toLowerCase() }] : []),
+            { createdBy: req.user.name || req.user.email },
+          ],
+        }
+      : {};
+
+    const totalInvestors = await Investor.countDocuments(filter);
+    const verifiedInvestors = await Investor.countDocuments({ ...filter, kycStatus: 'Verified' });
     const activeInvestors = await Investor.countDocuments({
+      ...filter,
       status: 'Active',
       kycStatus: 'Verified',
     });
-    const pendingKyc = await Investor.countDocuments({ kycStatus: 'Pending' });
-    const pendingPayment = await Investor.countDocuments({ paymentStatus: 'Pending' });
+    const pendingKyc = await Investor.countDocuments({ ...filter, kycStatus: 'Pending' });
+    const pendingPayment = await Investor.countDocuments({ ...filter, paymentStatus: 'Pending' });
+    const pendingAssociateApproval = await Investor.countDocuments({
+      ...filter,
+      approvalStage: 'pending_associate',
+    });
+    const approvedByAssociate = await Investor.countDocuments({
+      ...filter,
+      approvalStage: 'approved_by_associate',
+    });
 
-    // Sum of verified investments from InvestorPayment collection
-    const verifiedPaymentsAgg = await InvestorPayment.aggregate([
-      { $match: { status: 'Verified' } },
-      { $group: { _id: null, total: { $sum: '$amount' } } },
-    ]);
-    const totalInvestmentCollection = verifiedPaymentsAgg[0]?.total || 0;
+    // Role-based calculation for investment collections and liabilities
+    let totalInvestmentCollection = 0;
+    let totalCapitalMobilized = 0;
+    let contractualLiabilitiesSum = 0;
+    let totalPaidPayouts = 0;
 
-    // Calculate total contractual liabilities from active plans
-    const liabilitiesAgg = await Investor.aggregate([
-      { $match: { 'assignedPlan.status': 'Active' } },
-      { $group: { _id: null, total: { $sum: '$assignedPlan.contractualLiability' } } },
-    ]);
-    // If contractualLiability not explicitly populated, fall back to verifiedInvestment
-    const contractualLiabilitiesSum = liabilitiesAgg[0]?.total || totalInvestmentCollection;
+    if (isAssociate) {
+      // Find all investors belonging strictly to this associate
+      const associateInvestors = await Investor.find(filter)
+        .select('_id totalInvestment verifiedInvestment paymentStatus')
+        .lean();
+      const associateInvestorIds = associateInvestors.map((i) => i._id);
 
-    // Sum of paid payouts
-    const payoutsAgg = await InvestorPayout.aggregate([
-      { $match: { status: 'Paid' } },
-      { $group: { _id: null, total: { $sum: '$amount' } } },
-    ]);
-    const totalPaidPayouts = payoutsAgg[0]?.total || 0;
+      // Total Capital Mobilized by this Associate (real sum from their investors)
+      totalCapitalMobilized = associateInvestors.reduce(
+        (acc, curr) => acc + (Number(curr.totalInvestment) || 0),
+        0
+      );
 
-    const outstandingLiabilities = Math.max(0, contractualLiabilitiesSum - totalPaidPayouts);
+      // Verified Investment Received from this associate's investors only
+      if (associateInvestorIds.length > 0) {
+        const verifiedPaymentsAgg = await InvestorPayment.aggregate([
+          { $match: { status: 'Verified', investor: { $in: associateInvestorIds } } },
+          { $group: { _id: null, total: { $sum: '$amount' } } },
+        ]);
+        totalInvestmentCollection = verifiedPaymentsAgg[0]?.total || 0;
+
+        if (!totalInvestmentCollection) {
+          totalInvestmentCollection = associateInvestors
+            .filter((i) => i.paymentStatus === 'Verified')
+            .reduce((acc, curr) => acc + (Number(curr.verifiedInvestment) || 0), 0);
+        }
+
+        const liabilitiesAgg = await Investor.aggregate([
+          { $match: { _id: { $in: associateInvestorIds }, 'assignedPlan.status': 'Active' } },
+          { $group: { _id: null, total: { $sum: '$assignedPlan.contractualLiability' } } },
+        ]);
+        contractualLiabilitiesSum = liabilitiesAgg[0]?.total || 0;
+
+        const payoutsAgg = await InvestorPayout.aggregate([
+          { $match: { status: 'Paid', investor: { $in: associateInvestorIds } } },
+          { $group: { _id: null, total: { $sum: '$amount' } } },
+        ]);
+        totalPaidPayouts = payoutsAgg[0]?.total || 0;
+      }
+    } else {
+      // Super Admin: global system-wide aggregates
+      const verifiedPaymentsAgg = await InvestorPayment.aggregate([
+        { $match: { status: 'Verified' } },
+        { $group: { _id: null, total: { $sum: '$amount' } } },
+      ]);
+      totalInvestmentCollection = verifiedPaymentsAgg[0]?.total || 0;
+
+      const allInvestors = await Investor.find({}).select('totalInvestment').lean();
+      totalCapitalMobilized = allInvestors.reduce(
+        (acc, curr) => acc + (Number(curr.totalInvestment) || 0),
+        0
+      );
+
+      const liabilitiesAgg = await Investor.aggregate([
+        { $match: { 'assignedPlan.status': 'Active' } },
+        { $group: { _id: null, total: { $sum: '$assignedPlan.contractualLiability' } } },
+      ]);
+      contractualLiabilitiesSum = liabilitiesAgg[0]?.total || totalInvestmentCollection;
+
+      const payoutsAgg = await InvestorPayout.aggregate([
+        { $match: { status: 'Paid' } },
+        { $group: { _id: null, total: { $sum: '$amount' } } },
+      ]);
+      totalPaidPayouts = payoutsAgg[0]?.total || 0;
+    }
+
+    const outstandingLiabilities = isAssociate
+      ? contractualLiabilitiesSum
+      : Math.max(0, contractualLiabilitiesSum - totalPaidPayouts);
 
     return res.status(200).json({
       success: true,
       stats: {
         totalInvestors,
         verifiedInvestors,
+        totalCapitalMobilized,
         totalInvestmentReceived: totalInvestmentCollection,
         totalInvestmentCollection,
         activeInvestors,
@@ -363,6 +439,8 @@ const getInvestorStats = async (req, res) => {
         outstandingBalance: outstandingLiabilities,
         pendingKyc,
         pendingPayment,
+        pendingAssociateApproval,
+        approvedByAssociate,
       },
     });
   } catch (error) {
@@ -385,6 +463,7 @@ const getInvestors = async (req, res) => {
       kycStatus = '',
       paymentStatus = '',
       planStatus = '',
+      approvalStage = '',
       page = 1,
       limit = 20,
     } = req.query;
@@ -413,6 +492,10 @@ const getInvestors = async (req, res) => {
       query.paymentStatus = paymentStatus;
     }
 
+    if (approvalStage && approvalStage !== 'All') {
+      query.approvalStage = approvalStage;
+    }
+
     if (planStatus && planStatus !== 'All') {
       if (planStatus === 'Assigned') {
         query['assignedPlan.status'] = 'Active';
@@ -421,6 +504,37 @@ const getInvestors = async (req, res) => {
           { 'assignedPlan.status': { $in: ['None', 'Draft', null] } },
           { 'assignedPlan.planCode': { $in: ['', null] } },
         ];
+      }
+    }
+
+    // Role-based data scoping for Associates
+    if (req.user?.role === 'associate') {
+      const associateFilter = {
+        $or: [
+          { 'sourcedBy.associateId': req.user._id },
+          ...(req.user.memberId ? [{ 'sourcedBy.associateMemberId': req.user.memberId }] : []),
+          ...(req.user.email ? [{ 'sourcedBy.associateEmail': req.user.email.toLowerCase() }] : []),
+          { createdBy: req.user.name || req.user.email },
+        ],
+      };
+      if (query.$or) {
+        query.$and = [{ $or: query.$or }, associateFilter];
+        delete query.$or;
+      } else {
+        query.$or = associateFilter.$or;
+      }
+    } else {
+      // Super Admin: allow filtering by associateId if provided in query
+      if (req.query.associateId && req.query.associateId !== 'All') {
+        if (req.query.associateId === 'none' || req.query.associateId === 'direct') {
+          query.$or = [
+            { 'sourcedBy.associateId': { $exists: false } },
+            { 'sourcedBy.associateId': null },
+            { 'sourcedBy.associateName': { $in: ['', null] } },
+          ];
+        } else {
+          query['sourcedBy.associateId'] = req.query.associateId;
+        }
       }
     }
 
@@ -702,6 +816,41 @@ const createInvestor = async (req, res) => {
     const paymentReceiptUrl = getFileUrl('paymentReceipt') || req.body.paymentReceiptUrl || '';
     const agreementDocUrl = getFileUrl('agreement') || getFileUrl('investmentAgreement') || req.body.agreementUrl || '';
 
+    // Resolve Sourced By / Associate Referral Assignment
+    let sourcedByData = undefined;
+    if (req.user?.role === 'associate') {
+      sourcedByData = {
+        associateId: req.user._id,
+        associateName: req.user.name || '',
+        associateMobile: req.user.mobile || '',
+        associateEmail: req.user.email || '',
+        associateMemberId: req.user.memberId || '',
+      };
+    } else if (req.body.associateId && req.body.associateId !== 'none' && req.body.associateId !== '') {
+      const assocUser = await User.findById(req.body.associateId).lean();
+      if (assocUser) {
+        let assocMobile = assocUser.mobile || '';
+        if (assocUser.memberId) {
+          const mem = await Member.findOne({ memberId: assocUser.memberId }).select('mobile contactDetails').lean();
+          if (!assocMobile) assocMobile = mem?.mobile || mem?.contactDetails?.mobile || '';
+        }
+        sourcedByData = {
+          associateId: assocUser._id,
+          associateName: assocUser.name || '',
+          associateMobile: assocMobile,
+          associateEmail: assocUser.email || '',
+          associateMemberId: assocUser.memberId || '',
+        };
+      }
+    } else if (req.body.associateName || req.body.associateMobile) {
+      sourcedByData = {
+        associateName: (req.body.associateName || '').trim(),
+        associateMobile: (req.body.associateMobile || '').trim(),
+        associateEmail: (req.body.associateEmail || '').trim(),
+        associateMemberId: (req.body.associateMemberId || '').trim(),
+      };
+    }
+
     const newInvestor = new Investor({
       investorId: nextId,
       fullName: fullName.trim(),
@@ -743,7 +892,20 @@ const createInvestor = async (req, res) => {
       verifiedInvestment: 0,
       // IMPORTANT: Payment uploaded is PENDING verification until admin approves
       paymentStatus: investmentAmount ? 'Pending' : 'None',
-      createdBy: req.user?.name || 'Super Admin',
+      status: req.user?.role === 'associate' ? 'Pending' : 'Active',
+      approvalStage: req.user?.role === 'associate' ? 'pending_associate' : 'approved_by_admin',
+      associateApproval: req.user?.role === 'associate' ? {
+        status: 'Pending',
+      } : undefined,
+      adminApproval: req.user?.role === 'associate' ? {
+        status: 'Pending',
+      } : {
+        status: 'Approved',
+        approvedAt: new Date(),
+        approvedBy: req.user?.name || 'Super Admin',
+      },
+      sourcedBy: sourcedByData,
+      createdBy: req.user?.name || (req.user?.role === 'associate' ? 'Associate Member' : 'Super Admin'),
       adminRemarks: (adminRemarks || '').trim(),
     });
 
@@ -959,6 +1121,35 @@ const updateInvestor = async (req, res) => {
     if (bankBranchName !== undefined) investor.bankDetails.branchName = bankBranchName.trim();
     if (adminRemarks !== undefined) investor.adminRemarks = adminRemarks.trim();
     if (status) investor.status = status;
+
+    // Handle Associate assignment update by Super Admin
+    if (req.user?.role !== 'associate' && req.body.associateId !== undefined) {
+      if (req.body.associateId === 'none' || req.body.associateId === '' || !req.body.associateId) {
+        investor.sourcedBy = {
+          associateId: null,
+          associateName: '',
+          associateMobile: '',
+          associateEmail: '',
+          associateMemberId: '',
+        };
+      } else {
+        const assocUser = await User.findById(req.body.associateId).lean();
+        if (assocUser) {
+          let assocMobile = assocUser.mobile || '';
+          if (assocUser.memberId) {
+            const mem = await Member.findOne({ memberId: assocUser.memberId }).select('mobile contactDetails').lean();
+            if (!assocMobile) assocMobile = mem?.mobile || mem?.contactDetails?.mobile || '';
+          }
+          investor.sourcedBy = {
+            associateId: assocUser._id,
+            associateName: assocUser.name || '',
+            associateMobile: assocMobile,
+            associateEmail: assocUser.email || '',
+            associateMemberId: assocUser.memberId || '',
+          };
+        }
+      }
+    }
 
     // Handle uploaded files if provided
     const files = req.files || {};
@@ -3513,10 +3704,138 @@ const getFinancialReports = async (req, res) => {
   }
 };
 
+/**
+ * Associate Member Approves Investor -> Advances to Admin Approval
+ */
+const associateApproveInvestor = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { remarks = '' } = req.body;
+
+    const investor = await Investor.findOne({
+      $or: [{ _id: mongoose.Types.ObjectId.isValid(id) ? id : null }, { investorId: id }],
+    });
+    if (!investor) {
+      return res.status(404).json({ success: false, message: 'Investor record not found.' });
+    }
+
+    investor.approvalStage = 'approved_by_associate';
+    investor.associateApproval = {
+      status: 'Approved',
+      approvedAt: new Date(),
+      approvedBy: req.user?.name || 'Associate Member',
+      remarks: (remarks || '').trim(),
+    };
+
+    await investor.save();
+
+    return res.status(200).json({
+      success: true,
+      message: 'Investor approved successfully and submitted to Super Admin for final approval.',
+      investor,
+    });
+  } catch (error) {
+    console.error('associateApproveInvestor error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to approve investor: ' + error.message,
+    });
+  }
+};
+
+/**
+ * Super Admin Final Approval
+ */
+const finalApproveInvestor = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { remarks = '' } = req.body;
+
+    const investor = await Investor.findOne({
+      $or: [{ _id: mongoose.Types.ObjectId.isValid(id) ? id : null }, { investorId: id }],
+    });
+    if (!investor) {
+      return res.status(404).json({ success: false, message: 'Investor record not found.' });
+    }
+
+    investor.approvalStage = 'approved_by_admin';
+    investor.status = 'Active';
+    investor.adminApproval = {
+      status: 'Approved',
+      approvedAt: new Date(),
+      approvedBy: req.user?.name || 'Super Admin',
+      remarks: (remarks || '').trim(),
+    };
+
+    await investor.save();
+
+    return res.status(200).json({
+      success: true,
+      message: 'Investor granted final approval successfully and activated.',
+      investor,
+    });
+  } catch (error) {
+    console.error('finalApproveInvestor error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to grant final approval: ' + error.message,
+    });
+  }
+};
+
+/**
+ * Get active Associate Members for referral & assignment dropdown (Admin Only)
+ */
+const getAssociatesList = async (req, res) => {
+  try {
+    const users = await User.find({ role: 'associate' })
+      .select('_id name email mobile memberId assignedDistrict status approvalStatus')
+      .sort({ name: 1 })
+      .lean();
+
+    const memberIds = users.map((u) => u.memberId).filter(Boolean);
+    let memberMap = {};
+    if (memberIds.length > 0) {
+      const members = await Member.find({ memberId: { $in: memberIds } })
+        .select('memberId mobile contactDetails addressDetails personalDetails')
+        .lean();
+      members.forEach((m) => {
+        memberMap[m.memberId] = m;
+      });
+    }
+
+    const associates = users.map((u) => {
+      const mem = u.memberId ? memberMap[u.memberId] : null;
+      return {
+        _id: u._id,
+        name: u.name,
+        email: u.email,
+        mobile: u.mobile || mem?.mobile || mem?.contactDetails?.mobile || '',
+        memberId: u.memberId || '',
+        assignedDistrict: u.assignedDistrict || mem?.addressDetails?.district || '',
+        status: u.status || 'active',
+      };
+    });
+
+    return res.status(200).json({
+      success: true,
+      count: associates.length,
+      associates,
+    });
+  } catch (error) {
+    console.error('getAssociatesList error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to retrieve associate members: ' + error.message,
+    });
+  }
+};
+
 module.exports = {
   getInvestorStats,
   getInvestors,
   getInvestorById,
+  getAssociatesList,
   createInvestor,
   updateInvestor,
   verifyKyc,
@@ -3540,5 +3859,7 @@ module.exports = {
   getInvestorInvestments,
   createAdditionalInvestment,
   verifyInvestmentPayment,
+  associateApproveInvestor,
+  finalApproveInvestor,
 };
 

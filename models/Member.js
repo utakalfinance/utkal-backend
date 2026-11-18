@@ -41,7 +41,13 @@ const memberSchema = new mongoose.Schema(
     },
     membershipType: {
       type: String,
-      default: 'Associate Member',
+      default: 'Regular Member',
+      trim: true,
+    },
+    role: {
+      type: String,
+      enum: ['member', 'associate'],
+      default: 'member',
       trim: true,
     },
     membershipAmount: {

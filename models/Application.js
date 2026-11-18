@@ -18,6 +18,18 @@ const applicationSchema = new mongoose.Schema(
       enum: ['pending', 'approved', 'rejected', 'correction_required'],
       default: 'pending',
     },
+    role: {
+      type: String,
+      enum: ['member', 'associate'],
+      default: 'member',
+      trim: true,
+    },
+    approvalStatus: {
+      type: String,
+      enum: ['pending', 'approved', 'rejected'],
+      default: 'pending',
+      trim: true,
+    },
     personalDetails: {
       title: { type: String, trim: true },
       firstName: { type: String, trim: true },

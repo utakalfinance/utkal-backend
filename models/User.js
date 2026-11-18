@@ -38,8 +38,14 @@ const userSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ['admin', 'super_admin', 'district_admin', 'member'],
+      enum: ['admin', 'super_admin', 'district_admin', 'member', 'associate'],
       default: 'member',
+    },
+    approvalStatus: {
+      type: String,
+      enum: ['pending', 'approved', 'rejected'],
+      default: 'pending',
+      index: true,
     },
     districtId: {
       type: mongoose.Schema.Types.ObjectId,

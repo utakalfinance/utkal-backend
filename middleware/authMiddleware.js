@@ -57,8 +57,15 @@ const protect = async (req, res, next) => {
       });
     }
 
-    // If member user, check if application has been rejected
-    if (user.role === 'member') {
+    if (user.approvalStatus && user.approvalStatus !== 'approved') {
+      return res.status(403).json({
+        success: false,
+        message: `Account is ${user.approvalStatus}. Access is not permitted before administrator approval.`,
+      });
+    }
+
+    // If member or associate user, check if application has been rejected
+    if (user.role === 'member' || user.role === 'associate') {
       const application = user.applicationId
         ? await Application.findById(user.applicationId)
         : (user.memberId
@@ -68,6 +75,7 @@ const protect = async (req, res, next) => {
       if (application && application.status === 'rejected') {
         if (user.status === 'active') {
           user.status = 'inactive';
+          user.approvalStatus = 'rejected';
           await user.save().catch(() => {});
         }
         return res.status(403).json({
@@ -95,10 +103,13 @@ const authorize = (...roles) => {
   return (req, res, next) => {
     const userRole = req.user?.role;
     // Map 'admin' and 'super_admin' interchangeably for backward compatibility
+    // Map 'member' and 'associate' for statutory member-level permissions
     const hasRole =
       roles.includes(userRole) ||
       ((userRole === 'admin' || userRole === 'super_admin') &&
-        (roles.includes('admin') || roles.includes('super_admin')));
+        (roles.includes('admin') || roles.includes('super_admin'))) ||
+      ((userRole === 'member' || userRole === 'associate') &&
+        (roles.includes('member') || roles.includes('associate')));
 
     if (!req.user || !hasRole) {
       return res.status(403).json({

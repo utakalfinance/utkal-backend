@@ -325,12 +325,55 @@ const investorSchema = new mongoose.Schema(
       },
     ],
 
-    // Account Status
+    // Account Status & Two-Tier Approval Lifecycle
     status: {
       type: String,
       enum: ['Active', 'Pending', 'Suspended'],
       default: 'Active',
       index: true,
+    },
+    approvalStage: {
+      type: String,
+      enum: [
+        'pending_associate',
+        'approved_by_associate',
+        'approved_by_admin',
+        'rejected_by_associate',
+        'rejected_by_admin',
+      ],
+      default: 'approved_by_admin',
+      index: true,
+    },
+    associateApproval: {
+      status: {
+        type: String,
+        enum: ['Pending', 'Approved', 'Rejected'],
+        default: 'Pending',
+      },
+      approvedAt: { type: Date },
+      approvedBy: { type: String, default: '' },
+      remarks: { type: String, default: '' },
+    },
+    adminApproval: {
+      status: {
+        type: String,
+        enum: ['Pending', 'Approved', 'Rejected'],
+        default: 'Pending',
+      },
+      approvedAt: { type: Date },
+      approvedBy: { type: String, default: '' },
+      remarks: { type: String, default: '' },
+    },
+    sourcedBy: {
+      associateId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+        index: true,
+      },
+      associateName: { type: String, default: '' },
+      associateMobile: { type: String, default: '' },
+      associateEmail: { type: String, default: '' },
+      associateMemberId: { type: String, default: '' },
     },
     createdBy: {
       type: String,

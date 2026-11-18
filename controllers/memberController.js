@@ -3,6 +3,8 @@ const Application = require('../models/Application');
 const User = require('../models/User');
 const Member = require('../models/Member');
 const LoanEnquiry = require('../models/LoanEnquiry');
+const LoanApplication = require('../models/LoanApplication');
+const LoanSetting = require('../models/LoanSetting');
 const { generateMemberId } = require('../utils/memberIdGenerator');
 
 /**
@@ -115,6 +117,9 @@ const formatMemberRecord = (memberDoc) => {
     });
   }
 
+  const isAssociate = m.role === 'associate';
+  const resolvedMembershipType = isAssociate ? 'Associate Member' : 'Regular Member';
+
   return {
     _id: m._id,
     id: memberId,
@@ -124,7 +129,9 @@ const formatMemberRecord = (memberDoc) => {
     applicantName,
     email: m.email || c.email || '',
     mobile: m.mobile || c.mobile || '',
-    membershipType: m.membershipType || mem.membershipType || 'Associate Member',
+    membershipType: resolvedMembershipType,
+    role: isAssociate ? 'associate' : 'member',
+    isAssociate,
     membershipAmount: String(m.membershipAmount || mem.membershipAmount || 200),
     numberOfShares: m.numberOfShares || mem.numberOfShares || 10,
     shareValue: m.shareValue || mem.shareValue || 10,
@@ -174,6 +181,13 @@ const getMembers = async (req, res) => {
         const email = (app.contactDetails?.email || app.email || `member_${memberId.toLowerCase().replace(/[^a-z0-9]/g, '')}@utkalfinance.com`).toLowerCase().trim();
         const mobile = app.contactDetails?.mobile || app.mobile || '';
 
+        const appRole = app.role === 'associate' ? 'associate' : 'member';
+        const appMembershipType = appRole === 'associate'
+          ? 'Associate Member'
+          : (app.membershipDetails?.membershipType && app.membershipDetails.membershipType !== 'Associate Member'
+            ? app.membershipDetails.membershipType
+            : 'Regular Member');
+
         await Member.findOneAndUpdate(
           { applicationId: app._id },
           {
@@ -184,7 +198,8 @@ const getMembers = async (req, res) => {
               name,
               email,
               mobile,
-              membershipType: app.membershipDetails?.membershipType || 'Associate Member',
+              role: appRole,
+              membershipType: appMembershipType,
               membershipAmount: app.membershipDetails?.membershipAmount ? Number(app.membershipDetails.membershipAmount) : 200,
               numberOfShares: app.membershipDetails?.numberOfShares || 10,
               shareValue: app.membershipDetails?.shareValue || 10,
@@ -222,6 +237,54 @@ const getMembers = async (req, res) => {
         },
         { $set: { status: 'suspended' } }
       );
+    }
+
+    // 1c. Harmonize associate vs regular member status strictly based on admin approved applications
+    try {
+      const approvedAssociateApps = await Application.find(
+        { role: 'associate', status: 'approved' },
+        '_id applicationId memberId email'
+      ).lean();
+
+      const associateMemberIds = new Set(approvedAssociateApps.map((a) => a.memberId).filter(Boolean));
+      const associateAppIds = new Set(approvedAssociateApps.map((a) => String(a._id)));
+      const associateRefIds = new Set(approvedAssociateApps.map((a) => a.applicationId).filter(Boolean));
+
+      // 1. Any member not in the approved associate applications MUST be role: 'member', membershipType: 'Regular Member'
+      await Member.updateMany(
+        {
+          memberId: { $nin: Array.from(associateMemberIds) },
+          applicationId: { $nin: Array.from(associateAppIds) },
+          applicationRefId: { $nin: Array.from(associateRefIds) },
+        },
+        {
+          $set: {
+            role: 'member',
+            membershipType: 'Regular Member',
+          },
+        }
+      );
+
+      // 2. The genuine approved associate members are set to role: 'associate', membershipType: 'Associate Member'
+      if (associateMemberIds.size > 0 || associateAppIds.size > 0 || associateRefIds.size > 0) {
+        await Member.updateMany(
+          {
+            $or: [
+              { memberId: { $in: Array.from(associateMemberIds) } },
+              { applicationId: { $in: Array.from(associateAppIds) } },
+              { applicationRefId: { $in: Array.from(associateRefIds) } },
+            ],
+          },
+          {
+            $set: {
+              role: 'associate',
+              membershipType: 'Associate Member',
+            },
+          }
+        );
+      }
+    } catch (syncErr) {
+      console.warn('Note: Could not sync associate vs regular roles in MongoDB:', syncErr.message);
     }
 
     // 2. Fetch directly from the real Member collection in MongoDB with lean()
@@ -277,6 +340,13 @@ const getMemberById = async (req, res) => {
         const email = (app.contactDetails?.email || app.email || `member_${app._id}@utkalfinance.com`).toLowerCase().trim();
         const memberId = app.memberId || `NUF-M-${(app.applicationId || app._id.toString()).replace(/\D/g, '').slice(-4).padStart(4, '0')}`;
 
+        const appRole = app.role === 'associate' ? 'associate' : 'member';
+        const appMembershipType = appRole === 'associate'
+          ? 'Associate Member'
+          : (app.membershipDetails?.membershipType && app.membershipDetails.membershipType !== 'Associate Member'
+            ? app.membershipDetails.membershipType
+            : 'Regular Member');
+
         member = await Member.findOneAndUpdate(
           {
             $or: [{ memberId }, { applicationId: app._id }],
@@ -289,7 +359,8 @@ const getMemberById = async (req, res) => {
               name,
               email,
               mobile: app.contactDetails?.mobile || '',
-              membershipType: app.membershipDetails?.membershipType || 'Associate Member',
+              role: appRole,
+              membershipType: appMembershipType,
               membershipAmount: app.membershipDetails?.membershipAmount ? Number(app.membershipDetails.membershipAmount) : 200,
               numberOfShares: app.membershipDetails?.numberOfShares || 10,
               shareValue: app.membershipDetails?.shareValue || 10,
@@ -432,16 +503,51 @@ const getMemberLoanOverview = async (req, res) => {
       });
     }
 
-    // Active loan records (currently no active loan records)
-    const activeLoanAmount = 0;
-    const outstandingBalance = 0;
-    const totalRepaid = 0;
-    const currentLoanStatus = 'No Active Loan';
-    const nextLoanEligibility = 'Locked (Requires full repayment and verification of first ₹10,000 loan within 2 months)';
+    const resolvedMemberId = member?.memberId || user.memberId || '—';
+    const userEmail = (member?.email || user.email || '').toLowerCase().trim();
+    const userMobile = (member?.mobile || user.mobile || '').trim();
+
+    const loanSetting = await LoanSetting.getOrCreateDefault();
+    const defaultAmount = loanSetting.defaultAmount || 10000;
+    const monthlyRate = loanSetting.monthlyInterestRate || 1;
+    const tenureMonthsList = Array.isArray(loanSetting.availableTenureMonths) && loanSetting.availableTenureMonths.length > 0
+      ? loanSetting.availableTenureMonths
+      : [3, 6, 9];
+    const tenureDisplay = tenureMonthsList.map((m) => `${m} Months`).join(', ');
+
+    // Query real loan applications for this member
+    const customerFilter = {
+      $or: [
+        ...(resolvedMemberId && resolvedMemberId !== '—' ? [{ memberId: resolvedMemberId }] : []),
+        ...(isValidObjectId ? [{ userId: user._id }] : []),
+        ...(userEmail ? [{ email: userEmail }] : []),
+        ...(userMobile ? [{ mobile: userMobile }] : []),
+      ],
+    };
+
+    const loanApps = await LoanApplication.find(customerFilter).sort({ createdAt: -1 });
+    const latestApp = loanApps[0] || null;
+    const activeDisbursed = loanApps.filter(
+      (a) => a.disbursement?.isDisbursed === true && (a.repayment?.outstandingBalance || 0) > 0
+    );
+    const fullyRepaid = loanApps.filter(
+      (a) => a.disbursement?.isDisbursed === true && (a.repayment?.outstandingBalance || 0) === 0 && (a.repayment?.totalPaidAmount || 0) > 0
+    );
+
+    const activeLoanAmount = activeDisbursed.reduce((s, a) => s + (a.disbursement?.disbursedAmount || a.sanctionedAmount || 0), 0);
+    const outstandingBalance = activeDisbursed.reduce((s, a) => s + (a.repayment?.outstandingBalance || 0), 0);
+    const totalRepaid = loanApps.reduce((s, a) => s + (a.repayment?.totalPaidAmount || 0), 0);
+    const currentLoanStatus = latestApp ? latestApp.status : 'No Active Loan';
+    const isNextTierEligible = fullyRepaid.length > 0;
+    const nextLoanEligibility = isNextTierEligible
+      ? 'Unlocked (Tier 2 Eligible)'
+      : activeDisbursed.length > 0
+      ? 'Active Loan in Repayment'
+      : `Requires full repayment of First ₹${defaultAmount.toLocaleString('en-IN')} Loan`;
 
     const overviewData = {
       member: {
-        memberId: member?.memberId || user.memberId || '—',
+        memberId: resolvedMemberId,
         name: member?.name || user.name || 'Valued Member',
         email: member?.email || user.email,
         mobile: member?.mobile || user.mobile,
@@ -450,34 +556,34 @@ const getMemberLoanOverview = async (req, res) => {
         isApprovedMember: true,
       },
       firstLoanOffer: {
-        amount: 10000,
-        formattedAmount: '₹10,000',
-        interestRate: 5,
-        interestRateDisplay: '5%',
-        repaymentPeriod: 'Within 2 Months',
-        tenureMonths: 2,
+        amount: defaultAmount,
+        formattedAmount: `₹${defaultAmount.toLocaleString('en-IN')}`,
+        interestRate: monthlyRate,
+        interestRateDisplay: `${monthlyRate}% / Month`,
+        repaymentPeriod: tenureDisplay,
+        tenureMonths: loanSetting.defaultTenureMonths || tenureMonthsList[0] || 3,
         purpose: 'Statutory Member Introductory Credit Facility',
-        terms: 'Mandatory full repayment within two (2) calendar months to unlock subsequent loan tiers',
+        terms: `Repayment scheduled across ${tenureDisplay} under reducing balance methodology`,
       },
       loanSummary: {
         activeLoanAmount,
-        formattedActiveLoanAmount: '₹0',
+        formattedActiveLoanAmount: `₹${activeLoanAmount.toLocaleString('en-IN')}`,
         outstandingBalance,
-        formattedOutstandingBalance: '₹0',
+        formattedOutstandingBalance: `₹${outstandingBalance.toLocaleString('en-IN')}`,
         totalRepaid,
-        formattedTotalRepaid: '₹0',
+        formattedTotalRepaid: `₹${totalRepaid.toLocaleString('en-IN')}`,
         currentLoanStatus,
         nextLoanEligibility,
-        hasApplied: false,
-        activeLoansCount: 0,
-        isNextTierEligible: false,
+        hasApplied: loanApps.length > 0,
+        activeLoansCount: activeDisbursed.length,
+        isNextTierEligible,
       },
       businessRules: {
-        firstLoanAmount: 10000,
-        interestRate: 5,
-        repaymentPeriodMonths: 2,
-        ruleText: 'The next loan application is unlocked only after the first loan (₹10,000) has been fully repaid and all payments have been verified within the required 2-month period.',
-        disbursementNotice: 'Statutory procedural notice: Loan application review, approval, and money disbursement operate as separate stages.',
+        firstLoanAmount: defaultAmount,
+        interestRate: monthlyRate,
+        repaymentPeriodMonths: loanSetting.defaultTenureMonths || 3,
+        ruleText: `The next loan tier is unlocked once your first loan (₹${defaultAmount.toLocaleString('en-IN')}) has been fully repaid and verified.`,
+        disbursementNotice: 'Statutory notice: Loan evaluation, sanction, and funds disbursement operate as separate formal stages.',
       },
     };
 
@@ -509,31 +615,39 @@ const getAvailableLoans = async (req, res) => {
       });
     }
 
+    const loanSetting = await LoanSetting.getOrCreateDefault();
+    const defaultAmount = loanSetting.defaultAmount || 10000;
+    const monthlyRate = loanSetting.monthlyInterestRate || 1;
+    const tenureMonthsList = Array.isArray(loanSetting.availableTenureMonths) && loanSetting.availableTenureMonths.length > 0
+      ? loanSetting.availableTenureMonths
+      : [3, 6, 9];
+    const tenureDisplay = tenureMonthsList.map((m) => `${m} Months`).join(', ');
+
     const availableLoans = [
       {
         id: 'member-loan-tier-1',
         title: 'First Member Term Loan',
         badge: 'FIRST LOAN OFFER',
         tier: 'Tier 1 (First Member Loan)',
-        amount: 10000,
-        formattedAmount: '₹10,000',
-        interestRate: '5%',
-        interestRateValue: 5,
-        repaymentPeriod: 'Within 2 Months',
-        tenureMonths: 2,
+        amount: defaultAmount,
+        formattedAmount: `₹${defaultAmount.toLocaleString('en-IN')}`,
+        interestRate: `${monthlyRate}% / Month`,
+        interestRateValue: monthlyRate,
+        repaymentPeriod: tenureDisplay,
+        tenureMonths: loanSetting.defaultTenureMonths || tenureMonthsList[0] || 3,
         status: 'available',
         isLocked: false,
         category: 'Statutory Member Privilege',
-        description: 'Exclusive introductory loan facility designed for approved statutory members of New Utkal Finance Ltd.',
+        description: `Exclusive introductory loan facility of ₹${defaultAmount.toLocaleString('en-IN')} designed for approved statutory members of New Utkal Finance Ltd.`,
         eligibilityConditions: [
           'Approved statutory membership of New Utkal Finance Ltd.',
-          'Active membership status with verified share capital contribution',
+          'Active membership status with verified share capital contribution (minimum 10 shares)',
           'Completed KYC verification (Aadhaar Card, PAN Card, Photo and Signature on record)',
           'No delinquent or outstanding prior dues',
         ],
         repaymentGuidelines: [
-          'Fixed interest rate: 5%',
-          'Repayment timeline: Full repayment must happen within two (2) months',
+          `Monthly interest rate: ${monthlyRate}% / Month (Reducing Balance)`,
+          `Repayment options: Select ${tenureDisplay}`,
           'Approval & Disbursement: Loan evaluation, approval, and funds disbursement operate as separate formal stages',
           'Progression rule: The next loan tier is unlocked only after this first loan is fully repaid and verified',
         ],
@@ -545,17 +659,17 @@ const getAvailableLoans = async (req, res) => {
         tier: 'Tier 2',
         amount: 25000,
         formattedAmount: '₹25,000',
-        interestRate: '5%',
-        interestRateValue: 5,
+        interestRate: `${monthlyRate}% / Month`,
+        interestRateValue: monthlyRate,
         repaymentPeriod: 'Within 3 - 6 Months',
         tenureMonths: 6,
         status: 'locked',
         isLocked: true,
         category: 'Statutory Member Privilege',
         description: 'Higher credit tier unlocked exclusively for members with flawless repayment records.',
-        lockReason: 'Unlocked only after your first loan of ₹10,000 has been fully repaid and verified within the required 2-month period.',
+        lockReason: `Unlocked only after your first loan of ₹${defaultAmount.toLocaleString('en-IN')} has been fully repaid and verified.`,
         eligibilityConditions: [
-          '100% timely repayment of First Member Loan (₹10,000) within 2 months',
+          `100% timely repayment of First Member Loan (₹${defaultAmount.toLocaleString('en-IN')})`,
           'Ledger and audit reconciliation completed by branch administrator',
         ],
       },
@@ -566,8 +680,8 @@ const getAvailableLoans = async (req, res) => {
         tier: 'Tier 3',
         amount: 50000,
         formattedAmount: '₹50,000',
-        interestRate: '5%',
-        interestRateValue: 5,
+        interestRate: `${monthlyRate}% / Month`,
+        interestRateValue: monthlyRate,
         repaymentPeriod: 'Within 6 - 12 Months',
         tenureMonths: 12,
         status: 'locked',
@@ -643,50 +757,94 @@ const getMemberLoanHistory = async (req, res) => {
     const resolvedEmail = (memberDoc?.email || userEmail).toLowerCase().trim();
     const resolvedMobile = (memberDoc?.mobile || userMobile).trim();
 
-    // 2. Query actual MongoDB loan records for THIS member only (scoped to this member)
-    const queryConditions = [];
-    if (resolvedEmail) queryConditions.push({ email: resolvedEmail });
-    if (resolvedMobile) queryConditions.push({ mobileNumber: resolvedMobile });
+    // 2. Query actual MongoDB loan applications first
+    const customerFilter = {
+      $or: [
+        ...(resolvedMemberId && resolvedMemberId !== '—' ? [{ memberId: resolvedMemberId }] : []),
+        ...(isValidObjectId ? [{ userId: user._id }] : []),
+        ...(resolvedEmail ? [{ email: resolvedEmail }] : []),
+        ...(resolvedMobile ? [{ mobile: resolvedMobile }] : []),
+      ],
+    };
+
+    const loanApps = await LoanApplication.find(customerFilter).sort({ createdAt: -1 });
 
     let loanRecords = [];
-    if (queryConditions.length > 0) {
-      const enquiries = await LoanEnquiry.find({ $or: queryConditions }).sort({ createdAt: -1 });
 
-      loanRecords = enquiries.map((enq) => {
-        const isConverted = enq.status === 'Converted';
-        const isClosed = enq.status === 'Closed';
+    if (loanApps.length > 0) {
+      loanRecords = loanApps.map((app) => {
+        const isDisbursed = app.disbursement?.isDisbursed === true || app.status === 'Disbursed';
+        const isApprovedStatus = app.status === 'Approved' || isDisbursed;
+        const loanAmt = app.sanctionedAmount || app.requestedAmount || 10000;
+        const rate = app.interestRate || 1;
 
         return {
-          id: enq.enquiryId || enq._id.toString(),
-          loanId: enq.enquiryId || `LN-${enq._id.toString().slice(-6).toUpperCase()}`,
-          category: enq.loanCategory || 'Member Term Loan',
-          loanAmount: enq.expectedAmount || 10000,
-          formattedLoanAmount: enq.expectedAmount ? `₹${Number(enq.expectedAmount).toLocaleString('en-IN')}` : '₹10,000',
-          interestRate: '5%',
-          applicationDate: formatDate(enq.submittedAt || enq.createdAt),
-          approvalDate: enq.convertedAt ? formatDate(enq.convertedAt) : (isConverted ? formatDate(enq.updatedAt) : '—'),
-          disbursementDate: isConverted ? formatDate(enq.convertedAt || enq.updatedAt) : '—',
-          repaymentDeadline: isConverted && enq.convertedAt
-            ? formatDate(new Date(new Date(enq.convertedAt).getTime() + 60 * 24 * 60 * 60 * 1000))
-            : 'Within 2 Months',
-          totalRepaid: '₹0',
-          outstandingBalance: isConverted
-            ? (enq.expectedAmount ? `₹${Number(enq.expectedAmount).toLocaleString('en-IN')}` : '₹10,000')
+          id: app._id.toString(),
+          loanId: app.loanId || app.applicationId,
+          category: app.loanCategory || 'Statutory Member Credit Facility',
+          loanAmount: loanAmt,
+          formattedLoanAmount: `₹${Number(loanAmt).toLocaleString('en-IN')}`,
+          interestRate: rate <= 5 ? `${rate}% / Month` : `${rate}% p.a.`,
+          applicationDate: formatDate(app.createdAt),
+          approvalDate: app.finalApproval?.approvedAt
+            ? formatDate(app.finalApproval.approvedAt)
+            : isApprovedStatus
+            ? formatDate(app.updatedAt)
+            : '—',
+          disbursementDate: isDisbursed && app.disbursement?.disbursedAt
+            ? formatDate(app.disbursement.disbursedAt)
+            : '—',
+          repaymentDeadline: `${app.preferredTenureMonths || 3} Months`,
+          totalRepaid: `₹${Number(app.repayment?.totalPaidAmount || 0).toLocaleString('en-IN')}`,
+          outstandingBalance: isDisbursed
+            ? `₹${Number(app.repayment?.outstandingBalance || loanAmt).toLocaleString('en-IN')}`
             : '₹0',
-          loanStatus: isConverted
-            ? 'Active'
-            : isClosed
-            ? 'Rejected'
-            : enq.status === 'Contacted' || enq.status === 'Membership Registration Informed'
-            ? 'Under Review'
-            : 'Pending Approval',
-          rawStatus: enq.status,
-          adminRemarks: enq.adminRemarks || '',
+          loanStatus: app.status,
+          rawStatus: app.status,
+          adminRemarks: app.finalApproval?.remarks || app.districtVerification?.districtRemarks || '',
         };
       });
+    } else {
+      // Fallback: check loan enquiries if no formal loan application yet
+      const queryConditions = [];
+      if (resolvedEmail) queryConditions.push({ email: resolvedEmail });
+      if (resolvedMobile) queryConditions.push({ mobileNumber: resolvedMobile });
+
+      if (queryConditions.length > 0) {
+        const enquiries = await LoanEnquiry.find({ $or: queryConditions }).sort({ createdAt: -1 });
+        loanRecords = enquiries.map((enq) => {
+          const isConverted = enq.status === 'Converted';
+          const isClosed = enq.status === 'Closed';
+
+          return {
+            id: enq.enquiryId || enq._id.toString(),
+            loanId: enq.enquiryId || `LN-${enq._id.toString().slice(-6).toUpperCase()}`,
+            category: enq.loanCategory || 'Member Term Loan',
+            loanAmount: enq.expectedAmount || 10000,
+            formattedLoanAmount: enq.expectedAmount ? `₹${Number(enq.expectedAmount).toLocaleString('en-IN')}` : '₹10,000',
+            interestRate: '1% / Month',
+            applicationDate: formatDate(enq.submittedAt || enq.createdAt),
+            approvalDate: enq.convertedAt ? formatDate(enq.convertedAt) : (isConverted ? formatDate(enq.updatedAt) : '—'),
+            disbursementDate: isConverted ? formatDate(enq.convertedAt || enq.updatedAt) : '—',
+            repaymentDeadline: '3 Months',
+            totalRepaid: '₹0',
+            outstandingBalance: isConverted
+              ? (enq.expectedAmount ? `₹${Number(enq.expectedAmount).toLocaleString('en-IN')}` : '₹10,000')
+              : '₹0',
+            loanStatus: isConverted
+              ? 'Active'
+              : isClosed
+              ? 'Rejected'
+              : enq.status === 'Contacted' || enq.status === 'Membership Registration Informed'
+              ? 'Under Review'
+              : 'Pending Approval',
+            rawStatus: enq.status,
+            adminRemarks: enq.adminRemarks || '',
+          };
+        });
+      }
     }
 
-    // Return strictly actual records from MongoDB (0 if member hasn't applied)
     return res.status(200).json({
       success: true,
       memberId: resolvedMemberId,

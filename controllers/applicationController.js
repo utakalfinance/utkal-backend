@@ -418,8 +418,56 @@ const createApplication = async (req, res) => {
       }
     }
 
+    // Set initial application role and approvalStatus
+    const initialRole = (account.membershipType || formData.role || account.role || '').toLowerCase().includes('associate') ? 'associate' : 'member';
+    applicationData.role = initialRole;
+    applicationData.approvalStatus = 'pending';
+
     const newApplication = await Application.create(applicationData);
-    console.log(`Application saved successfully: ${newApplication.applicationId}`);
+    console.log(`Application saved successfully: ${newApplication.applicationId} with initial role: ${initialRole}`);
+
+    // Create or link User account with pending approvalStatus (No access until admin approval)
+    try {
+      const userEmail = email.toLowerCase().trim();
+      const rawPassword = account.password || generateTempPassword(10);
+      const salt = await bcrypt.genSalt(10);
+      const hashedPassword = await bcrypt.hash(rawPassword, salt);
+
+      const applicantFullName = [
+        personal.title,
+        personal.firstName,
+        personal.middleName,
+        personal.lastName,
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .trim() || 'New Applicant';
+
+      await User.findOneAndUpdate(
+        {
+          $or: [
+            { applicationId: newApplication._id },
+            { email: userEmail },
+          ],
+        },
+        {
+          $set: {
+            name: applicantFullName,
+            email: userEmail,
+            mobile: mobile,
+            password: hashedPassword,
+            role: initialRole,
+            status: 'pending',
+            approvalStatus: 'pending',
+            applicationId: newApplication._id,
+            mustChangePassword: true,
+          },
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+    } catch (userCreateErr) {
+      console.warn('Notice on initial user creation for application:', userCreateErr.message);
+    }
 
     return res.status(201).json({
       success: true,
@@ -465,7 +513,7 @@ const getApplications = async (req, res) => {
 const updateApplicationStatus = async (req, res) => {
   try {
     const { id } = req.params;
-    const { status } = req.body;
+    const { status, role } = req.body;
 
     const allowedStatuses = ['pending', 'approved', 'rejected'];
 
@@ -492,50 +540,23 @@ const updateApplicationStatus = async (req, res) => {
       });
     }
 
+    // Normalize requested role safely (case-insensitive, variant-tolerant)
+    const rawRole = (role || req.body?.accountType || req.body?.roleType || '').toString().toLowerCase().trim();
+    let targetRole;
+    if (rawRole === 'associate' || rawRole.includes('associate')) {
+      targetRole = 'associate';
+    } else if (rawRole === 'member' || rawRole.includes('member')) {
+      targetRole = 'member';
+    } else {
+      const appMembership = (application.membershipDetails?.membershipType || application.role || '').toLowerCase();
+      targetRole = appMembership.includes('associate') ? 'associate' : 'member';
+    }
+    const targetMembershipType = targetRole === 'associate' ? 'Associate Member' : 'Member';
+
     // APPROVAL FLOW
     if (status === 'approved') {
-      // 1. Verify current status is pending
-      if (application.status !== 'pending') {
-        if (application.status === 'approved') {
-          const existingUser = await User.findOne({
-            $or: [
-              { applicationId: application._id },
-              ...(application.memberId ? [{ memberId: application.memberId }] : []),
-              ...(application.contactDetails?.email ? [{ email: application.contactDetails.email.toLowerCase() }] : []),
-            ],
-          });
-          return res.status(200).json({
-            success: true,
-            message: 'Application is already approved',
-            applicationId: application.applicationId || application._id.toString(),
-            memberId: application.memberId || existingUser?.memberId,
-            alreadyApproved: true,
-            emailSent: application.credentialsEmailStatus === 'sent',
-            application,
-            member: existingUser
-              ? {
-                _id: existingUser._id,
-                memberId: existingUser.memberId,
-                name: existingUser.name,
-                email: existingUser.email,
-                mobile: existingUser.mobile,
-                role: existingUser.role,
-                status: existingUser.status,
-                mustChangePassword: existingUser.mustChangePassword ?? false,
-                applicationId: existingUser.applicationId,
-              }
-              : null,
-          });
-        }
-        return res.status(400).json({
-          success: false,
-          message: `Cannot approve application. Current status is "${application.status}". Only pending applications can be approved.`,
-        });
-      }
-
-      // Extract applicant details
-      const email = application.contactDetails?.email;
-      const mobile = application.contactDetails?.mobile || '';
+      const email = (application.contactDetails?.email || application.email || '').toLowerCase().trim();
+      const mobile = application.contactDetails?.mobile || application.mobile || '';
 
       if (!email) {
         return res.status(400).json({
@@ -548,86 +569,132 @@ const updateApplicationStatus = async (req, res) => {
       const nameParts = [p.title, p.firstName, p.middleName, p.lastName].filter(Boolean);
       const name = nameParts.length > 0 ? nameParts.join(' ') : 'Applicant';
 
-      // Check if application is already approved
+      // 1. If application is already approved, update role & synchronization if requested
       if (application.status === 'approved') {
-        const existingMember = await Member.findOne({ applicationId: application._id });
-        if (existingMember) {
-          return res.status(200).json({
-            success: true,
-            message: `Application is already approved with Member ID ${existingMember.memberId}.`,
-            applicationId: application.applicationId || application._id.toString(),
-            memberId: existingMember.memberId,
-            alreadyExists: true,
-            emailSent: existingMember.credentialsEmailStatus === 'sent',
-            credentialsEmailStatus: existingMember.credentialsEmailStatus,
-            application,
-            member: {
-              _id: existingMember._id,
-              memberId: existingMember.memberId,
-              name: existingMember.name,
-              email: existingMember.email,
-              mobile: existingMember.mobile,
-              role: 'member',
-              status: existingMember.status,
-              applicationId: existingMember.applicationId,
-              createdAt: existingMember.createdAt,
+        const updatedUser = await User.findOneAndUpdate(
+          {
+            $or: [
+              { applicationId: application._id },
+              ...(application.memberId ? [{ memberId: application.memberId }] : []),
+              { email },
+            ],
+          },
+          {
+            $set: {
+              role: targetRole,
+              approvalStatus: 'approved',
+              status: 'active',
+              name,
+              email,
+              ...(mobile ? { mobile } : {}),
+              ...(application.memberId ? { memberId: application.memberId } : {}),
+              applicationId: application._id,
             },
-          });
-        }
+          },
+          { new: true, runValidators: true }
+        );
+
+        if (!application.membershipDetails) application.membershipDetails = {};
+        application.membershipDetails.membershipType = targetMembershipType;
+        application.role = targetRole;
+        application.approvalStatus = 'approved';
+        await application.save();
+
+        const updatedMember = await Member.findOneAndUpdate(
+          { applicationId: application._id },
+          {
+            $set: {
+              membershipType: targetMembershipType,
+              role: targetRole,
+              status: 'active',
+              userId: updatedUser?._id,
+            },
+          },
+          { new: true }
+        );
+
+        return res.status(200).json({
+          success: true,
+          message: `Application is approved with role "${targetRole === 'associate' ? 'Associate Member' : 'Member'}".`,
+          applicationId: application.applicationId || application._id.toString(),
+          memberId: application.memberId || updatedUser?.memberId,
+          alreadyApproved: true,
+          emailSent: application.credentialsEmailStatus === 'sent',
+          application,
+          user: updatedUser,
+          member: {
+            _id: updatedMember?._id || updatedUser?._id,
+            memberId: application.memberId || updatedUser?.memberId,
+            name: updatedUser?.name || name,
+            email,
+            mobile,
+            role: targetRole,
+            status: 'active',
+            approvalStatus: 'approved',
+            membershipType: targetMembershipType,
+            applicationId: application._id,
+            createdAt: updatedMember?.createdAt || application.createdAt,
+          },
+        });
       }
 
-      // 1. Determine Unique Member ID (Format: NUF-M-0001, NUF-M-0002, etc.)
+      // 2. Determine Unique Member ID (Format: NUF-M-0001, NUF-M-0002, etc.)
       let memberId = application.memberId;
       if (!memberId || !memberId.startsWith('NUF-M-')) {
         memberId = await generateMemberId();
       }
 
-      // 2. Generate Temporary Password & Hash with bcrypt
+      // 3. Generate Temporary Password & Hash with bcrypt
       const tempPassword = generateTempPassword(10);
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(tempPassword, salt);
 
-      // 3. Create or Link User Account for THIS Application
-      let userDoc = await User.findOne({ applicationId: application._id });
-      if (userDoc) {
-        userDoc.password = hashedPassword;
-        userDoc.mustChangePassword = true;
-        userDoc.name = name;
-        userDoc.mobile = mobile;
-        userDoc.memberId = memberId;
-        userDoc.status = 'active';
-        await userDoc.save();
-      } else {
-        const userEmail = email.toLowerCase().trim();
-
-        try {
-          userDoc = await User.create({
+      // 4. Atomically Create or Update User Account in 'users' collection using findOneAndUpdate
+      const updatedUser = await User.findOneAndUpdate(
+        {
+          $or: [
+            { applicationId: application._id },
+            ...(application.memberId ? [{ memberId: application.memberId }] : []),
+            { email },
+          ],
+        },
+        {
+          $set: {
             name,
-            email: userEmail,
+            email,
             mobile,
             password: hashedPassword,
-            role: 'member',
+            role: targetRole,
             status: 'active',
-            memberId,
+            approvalStatus: 'approved',
+            memberId: memberId,
             applicationId: application._id,
             mustChangePassword: true,
-          });
-        } catch (userError) {
-          console.error('Notice on user creation:', userError.message);
+          },
+        },
+        {
+          new: true,
+          upsert: true,
+          setDefaultsOnInsert: true,
+          runValidators: true,
         }
-      }
+      );
 
-      console.log(`Application approved: ${application.applicationId || application._id}`);
-      console.log(`Member created: ${memberId}`);
+      console.log(`Application approved: ${application.applicationId || application._id} as ${targetRole}`);
+      console.log(`Member created: ${memberId}, User _id: ${updatedUser._id}, Role: ${updatedUser.role}, ApprovalStatus: ${updatedUser.approvalStatus}`);
 
-      // 4. Update Application Document
+      // 5. Update Application Document
       application.status = 'approved';
       application.memberId = memberId;
+      application.role = targetRole;
+      application.approvalStatus = 'approved';
       application.reviewedAt = new Date();
       application.credentialsEmailStatus = 'pending';
+      if (!application.membershipDetails) application.membershipDetails = {};
+      application.membershipDetails.membershipType = targetMembershipType;
       await application.save();
 
-      // 5. Save into dedicated members collection in MongoDB Atlas strictly keyed by applicationId
+      // 6. Save into dedicated members collection in MongoDB Atlas strictly keyed by applicationId
       let savedMember;
       try {
         savedMember = await Member.findOneAndUpdate(
@@ -637,11 +704,12 @@ const updateApplicationStatus = async (req, res) => {
               memberId,
               applicationId: application._id,
               applicationRefId: application.applicationId || application._id.toString(),
-              userId: userDoc ? userDoc._id : undefined,
+              userId: updatedUser ? updatedUser._id : undefined,
               name,
               email: email.toLowerCase().trim(),
               mobile,
-              membershipType: application.membershipDetails?.membershipType || 'Associate Member',
+              membershipType: targetMembershipType,
+              role: targetRole,
               membershipAmount: application.membershipDetails?.membershipAmount ? Number(application.membershipDetails.membershipAmount) : 200,
               numberOfShares: application.membershipDetails?.numberOfShares || 10,
               shareValue: application.membershipDetails?.shareValue || 10,
@@ -687,7 +755,7 @@ const updateApplicationStatus = async (req, res) => {
               applicationId: application._id,
               applicationRefId: appId,
               memberId,
-              userId: userDoc ? userDoc._id : undefined,
+              userId: updatedUser ? updatedUser._id : undefined,
               memberName: name,
               email: email.toLowerCase().trim(),
               mobile,
@@ -769,22 +837,24 @@ const updateApplicationStatus = async (req, res) => {
         }
       });
 
-      // 8. Sanitized Member & Payment Response returned immediately
+      // 9. Sanitized Member & Payment Response returned immediately with updated User document
       const memberResponse = {
-        _id: savedMember?._id || userDoc?._id,
+        _id: savedMember?._id || updatedUser?._id,
         memberId,
         name,
         email: email.toLowerCase().trim(),
         mobile,
-        role: 'member',
+        role: targetRole,
         status: 'active',
+        approvalStatus: 'approved',
+        membershipType: targetMembershipType,
         applicationId: application._id,
         createdAt: savedMember?.createdAt || new Date(),
       };
 
       return res.status(200).json({
         success: true,
-        message: 'Application approved, member account and payment ledger record created successfully. Credentials email dispatched.',
+        message: `Application approved, member account and payment ledger record created successfully as ${targetRole === 'associate' ? 'Associate Member' : 'Member'}. Credentials email dispatched.`,
         applicationId: application.applicationId || application._id.toString(),
         memberId,
         paymentId: savedPayment?.paymentId,
@@ -792,6 +862,7 @@ const updateApplicationStatus = async (req, res) => {
         emailSent: true,
         credentialsEmailStatus: application.credentialsEmailStatus || 'pending',
         application,
+        user: updatedUser,
         member: memberResponse,
       });
     }
@@ -800,10 +871,11 @@ const updateApplicationStatus = async (req, res) => {
     application.status = status;
     if (status === 'rejected') {
       application.reviewedAt = new Date();
+      application.approvalStatus = 'rejected';
 
       const applicantEmail = (application.contactDetails?.email || application.email || '').toLowerCase().trim();
 
-      // Deactivate any existing User accounts linked to this application
+      // Deactivate any existing User accounts linked to this application and mark approvalStatus as rejected
       await User.updateMany(
         {
           $or: [
@@ -812,7 +884,7 @@ const updateApplicationStatus = async (req, res) => {
             ...(applicantEmail ? [{ email: applicantEmail }] : []),
           ],
         },
-        { $set: { status: 'inactive' } }
+        { $set: { status: 'inactive', approvalStatus: 'rejected' } }
       );
 
       // Deactivate/suspend any Member records linked to this application
@@ -1692,12 +1764,21 @@ const resendMemberCredentials = async (req, res) => {
  */
 const serveDocumentFile = (req, res) => {
   try {
-    const filename = path.basename(req.params.filename || '');
+    const rawParam = req.params.filename || '';
+    let filename = '';
+    try {
+      filename = path.basename(decodeURIComponent(rawParam));
+    } catch {
+      filename = path.basename(rawParam);
+    }
     if (!filename) {
       return res.status(400).json({ success: false, message: 'Filename is required' });
     }
 
-    const filePath = path.join(__dirname, '../uploads/documents', filename);
+    let filePath = path.join(__dirname, '../uploads/documents', filename);
+    if (!fs.existsSync(filePath)) {
+      filePath = path.join(__dirname, '../uploads', filename);
+    }
 
     if (!fs.existsSync(filePath)) {
       return res.status(404).json({
@@ -1719,6 +1800,7 @@ const serveDocumentFile = (req, res) => {
 
     const contentType = mimeTypes[ext] || 'application/octet-stream';
     res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     return res.sendFile(filePath);

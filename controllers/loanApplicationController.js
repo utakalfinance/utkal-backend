@@ -4,6 +4,7 @@ const Member = require('../models/Member');
 const Application = require('../models/Application');
 const District = require('../models/District');
 const User = require('../models/User');
+const LoanSetting = require('../models/LoanSetting');
 
 /**
  * Generate unique sequential Loan Application ID: LOAN-2026-1001
@@ -130,10 +131,12 @@ const computeCustomerApplicationStatus = (app) => {
   if (
     app.status === 'Pending Final Approval' ||
     app.status === 'Forwarded to Super Admin' ||
-    (app.districtVerification?.status === 'Verified' && (app.finalApproval?.status === 'Pending' || !app.finalApproval?.status)) ||
-    (app.districtVerification?.isForwardedToSuperAdmin === true && (app.finalApproval?.status === 'Pending' || !app.finalApproval?.status))
+    app.status === 'Pending District Verification' ||
+    app.status === 'Submitted' ||
+    app.status === 'Under Verification' ||
+    (app.finalApproval?.status === 'Pending' || !app.finalApproval?.status)
   ) {
-    return 'Verified by District Admin – Pending Final Approval';
+    return 'Pending Final Approval';
   }
   return app.status;
 };
@@ -145,13 +148,17 @@ const computeCustomerApplicationStatus = (app) => {
  */
 const generateOrSyncEmiSchedule = (loan) => {
   if (!loan) return null;
-  const isDisbursed = Boolean(
+  const isEligible = Boolean(
     loan.disbursement?.isDisbursed === true ||
     loan.status === 'Active' ||
     loan.status === 'Disbursed' ||
-    loan.status === 'Closed'
+    loan.status === 'Closed' ||
+    loan.finalApproval?.status === 'Approved' ||
+    loan.status === 'Approved' ||
+    loan.status === 'Approved – Not Disbursed' ||
+    loan.status === 'Approved - Not Disbursed'
   );
-  if (!isDisbursed) return loan;
+  if (!isEligible) return loan;
 
   const principal =
     Number(loan.disbursement?.disbursedAmount) ||
@@ -165,8 +172,8 @@ const generateOrSyncEmiSchedule = (loan) => {
     Number(loan.preferredTenureMonths) ||
     3;
 
-  const annualRate = Number(loan.interestRate) || 5; // e.g. 5% p.a. default, or 11%/12% based on CIBIL score
-  const monthlyRate = annualRate / (12 * 100);
+  const rawRate = Number(loan.interestRate) || 1; // Monthly rate if <= 5 (e.g. 1% / mo) or annual if > 5 (e.g. 12% p.a.)
+  const monthlyRate = rawRate <= 5 ? rawRate / 100 : rawRate / (12 * 100);
 
   // Standard Reducing Balance Monthly EMI formula:
   // E = P * r * (1 + r)^n / ((1 + r)^n - 1)
@@ -473,11 +480,14 @@ const getCustomerLoanOverview = async (req, res) => {
       fullyRepaidCount: fullyRepaidLoans.length,
     };
 
+    const loanSetting = await LoanSetting.getOrCreateDefault();
+
     return res.status(200).json({
       success: true,
       data: {
         loanEligibility: baseEligibility,
-        firstLoanAmount: 10000,
+        firstLoanAmount: loanSetting.defaultAmount || 10000,
+        loanSetting,
         applicationStatus: latestApp ? computeCustomerApplicationStatus(latestApp) : 'Not Applied',
         rawApplicationStatus: latestApp ? latestApp.status : 'Not Applied',
         selectedRepaymentTenure: latestApp
@@ -581,23 +591,53 @@ const getAvailableLoanProducts = async (req, res) => {
       }
     }
 
-    // Client-approved First Loan policy
+    // Retrieve active dynamic Loan & EMI Settings configured by Admin
+    const loanSetting = await LoanSetting.getOrCreateDefault();
+
+    const activeAmount = loanSetting.defaultAmount || 10000;
+    const activeMinAmount = loanSetting.minAmount || 5000;
+    const activeMaxAmount = loanSetting.maxAmount || 50000;
+    const activeIsFixed = loanSetting.isAmountFixed !== false;
+    const activeTenures =
+      Array.isArray(loanSetting.availableTenureMonths) && loanSetting.availableTenureMonths.length > 0
+        ? loanSetting.availableTenureMonths
+        : [3, 6, 9];
+
+    // Client-approved First Loan policy (configured dynamically)
     const loanProducts = [
       {
         id: 'tier-1-first-member-loan',
         loanType: 'First Member Term Loan',
-        tier: 'Tier 1 (Client Approved First Loan)',
-        badge: 'FIRST LOAN FACILITY',
-        description:
-          'Approved statutory credit facility of ₹10,000 designed exclusively for admitted members of New Utkal Finance Ltd.',
-        interestRate: 11,
-        interestRateDisplay: '11% (>600 CIBIL) / 12% (<=600 CIBIL)*',
-        minAmount: 10000,
-        maxAmount: 10000,
-        defaultAmount: 10000,
-        isAmountFixed: true,
-        availableTenureMonths: [3, 6, 9],
-        tenureDisplay: '3 Months, 6 Months, or 9 Months',
+        tier: 'Tier 1 (Member Credit Facility)',
+        badge: 'ACTIVE LOAN FACILITY',
+        description: `Approved statutory credit facility of ₹${activeAmount.toLocaleString('en-IN')} designed exclusively for admitted members of New Utkal Finance Ltd.`,
+        interestRate: loanSetting.monthlyInterestRate || 1,
+        highCibilInterestRate: loanSetting.highCibilInterestRate || 12,
+        standardCibilInterestRate: loanSetting.standardCibilInterestRate || 12,
+        cibilThreshold: loanSetting.cibilThreshold || 600,
+        interestRateDisplay:
+          loanSetting.interestRateDisplay ||
+          `${loanSetting.monthlyInterestRate || 1}% / Month`,
+        minAmount: activeMinAmount,
+        maxAmount: activeMaxAmount,
+        defaultAmount: activeAmount,
+        isAmountFixed: activeIsFixed,
+        allowedAmounts: loanSetting.allowedAmounts || [10000, 20000, 30000, 50000],
+        availableTenureMonths: activeTenures,
+        defaultTenureMonths: loanSetting.defaultTenureMonths || activeTenures[0] || 3,
+        tenureDisplay: activeTenures.map((m) => `${m} Months`).join(', '),
+        emiCalculationMethod: loanSetting.emiCalculationMethod || 'reducing_balance',
+        processingFeePercent: loanSetting.processingFeePercent ?? 1,
+        processingFeeFixed: loanSetting.processingFeeFixed ?? 0,
+        aboutEmiNote:
+          loanSetting.aboutEmiNote ||
+          'EMI is calculated on reducing balance. Monthly repayments are scheduled on the 5th of each month following disbursement with zero prepayment penalty.',
+        repaymentGuidelines: loanSetting.repaymentGuidelines || [
+          'Monthly installments are auto-debited or payable via direct UPI/IMPS.',
+          'Grace period of 3 business days is provided before penalty charges.',
+          'Timely repayments elevate your credit profile and unlock higher credit limits.',
+        ],
+        policyReference: loanSetting.policyReference || 'Utkal Finance Statutory Member Credit Policy 2026',
         eligibilityCriteria: [
           'Approved statutory associate membership of New Utkal Finance Ltd.',
           'Active share capital contribution (minimum 10 shares verified)',
@@ -626,16 +666,16 @@ const getAvailableLoanProducts = async (req, res) => {
         badge: 'LOCKED TIER',
         description:
           'Higher credit tier unlocked exclusively for members with verified 100% full repayment of their First Member Loan.',
-        interestRate: 11,
-        interestRateDisplay: '11% (>600 CIBIL) / 12% (<=600 CIBIL)*',
-        minAmount: 25000,
-        maxAmount: 25000,
-        defaultAmount: 25000,
+        interestRate: loanSetting.baseInterestRate || 11,
+        interestRateDisplay: `${loanSetting.baseInterestRate || 11}% p.a.`,
+        minAmount: activeMaxAmount,
+        maxAmount: activeMaxAmount * 2,
+        defaultAmount: activeMaxAmount,
         isAmountFixed: true,
-        availableTenureMonths: [6, 9],
-        tenureDisplay: '6 to 9 Months',
+        availableTenureMonths: [6, 9, 12],
+        tenureDisplay: '6, 9, or 12 Months',
         eligibilityCriteria: [
-          '100% timely repayment of First Member Loan (₹10,000) verified on the backend',
+          `100% timely repayment of First Member Loan (₹${activeAmount.toLocaleString('en-IN')}) verified on the backend`,
           'Credit clearance audit from designated District Admin',
           'Super Admin configuration of higher loan sanctioned limit',
         ],
@@ -646,7 +686,7 @@ const getAvailableLoanProducts = async (req, res) => {
         ],
         isEligible: false,
         ineligibilityReason:
-          'Unlocked only after complete repayment of your First Member Loan (₹10,000) is verified on the backend.',
+          `Unlocked only after complete repayment of your First Member Loan (₹${activeAmount.toLocaleString('en-IN')}) is verified on the backend.`,
       },
     ];
 
@@ -658,6 +698,7 @@ const getAvailableLoanProducts = async (req, res) => {
       activeAppId,
       memberDistrict:
         member?.addressDetails?.district || application?.addressDetails?.district || 'Khurda',
+      loanSetting,
       products: loanProducts,
     });
   } catch (error) {
@@ -732,28 +773,45 @@ const applyForLoan = async (req, res) => {
       cibilScore: submittedCibil,
     } = req.body;
 
-    const rawCibil = submittedCibil ? parseInt(submittedCibil, 10) : null;
-    const cibilScore = !isNaN(rawCibil) && rawCibil >= 300 && rawCibil <= 900 ? rawCibil : null;
-    // Client guideline: 11% for CIBIL > 600, 12% for CIBIL <= 600
-    const calculatedRate = cibilScore ? (cibilScore > 600 ? 11 : 12) : 11;
+    // Retrieve active dynamic Loan & EMI Settings
+    const loanSetting = await LoanSetting.getOrCreateDefault();
 
     // Field validations
     const errors = {};
 
-    // Validate tenure: Must be 3, 6, or 9 months
+    // Dynamic Loan Amount handling
+    let finalRequestedAmount = loanSetting.defaultAmount || 10000;
+    if (!loanSetting.isAmountFixed && req.body.requestedAmount) {
+      const parsedAmt = Number(req.body.requestedAmount);
+      if (!isNaN(parsedAmt) && parsedAmt >= loanSetting.minAmount && parsedAmt <= loanSetting.maxAmount) {
+        finalRequestedAmount = parsedAmt;
+      } else {
+        errors.requestedAmount = `Requested loan amount must be between ₹${loanSetting.minAmount.toLocaleString('en-IN')} and ₹${loanSetting.maxAmount.toLocaleString('en-IN')}`;
+      }
+    }
+
+    const allowableTenures =
+      Array.isArray(loanSetting.availableTenureMonths) && loanSetting.availableTenureMonths.length > 0
+        ? loanSetting.availableTenureMonths
+        : [3, 6, 9];
+
+    // Validate tenure: Must be in configured allowable tenures
     const tenureNum = parseInt(preferredTenureMonths, 10);
-    if (![3, 6, 9].includes(tenureNum)) {
-      errors.preferredTenureMonths =
-        'Please select an approved repayment tenure: 3 Months, 6 Months, or 9 Months';
+    if (!allowableTenures.includes(tenureNum)) {
+      errors.preferredTenureMonths = `Please select an approved repayment tenure: ${allowableTenures.map((t) => `${t} Months`).join(', ')}`;
     }
 
-    if (!loanPurpose || !loanPurpose.trim()) {
-      errors.loanPurpose = 'Loan purpose explanation is required';
-    }
+    const rawCibil = submittedCibil ? parseInt(submittedCibil, 10) : null;
+    const cibilScore = !isNaN(rawCibil) && rawCibil >= 300 && rawCibil <= 900 ? rawCibil : null;
+    const threshold = loanSetting.cibilThreshold || 600;
+    const highRate = loanSetting.highCibilInterestRate || loanSetting.baseInterestRate || 11;
+    const stdRate = loanSetting.standardCibilInterestRate || loanSetting.baseInterestRate || 12;
+    const calculatedRate = cibilScore ? (cibilScore > threshold ? highRate : stdRate) : (loanSetting.baseInterestRate || 11);
 
-    if (monthlyIncome === undefined || monthlyIncome === '' || Number(monthlyIncome) < 0) {
-      errors.monthlyIncome = 'Valid monthly income is required';
-    }
+    const finalLoanPurpose = (loanPurpose && loanPurpose.trim()) || 'Statutory Member Term Loan Facility';
+    const finalMonthlyIncome = monthlyIncome !== undefined && monthlyIncome !== '' && Number(monthlyIncome) >= 0
+      ? Number(monthlyIncome)
+      : 25000;
 
     if (Object.keys(errors).length > 0) {
       return res.status(400).json({
@@ -818,8 +876,8 @@ const applyForLoan = async (req, res) => {
 
     const appId = await generateLoanAppId();
 
-    // First loan amount strictly follows approved client policy: ₹10,000
-    const requestedAmount = 10000;
+    // First loan amount follows dynamic policy
+    const requestedAmount = finalRequestedAmount;
 
     const newLoanApp = await LoanApplication.create({
       applicationId: appId,
@@ -839,26 +897,28 @@ const applyForLoan = async (req, res) => {
       interestRate: calculatedRate,
       cibilScore,
       cibilStatus: cibilScore
-        ? cibilScore > 600
-          ? 'Score > 600 (11% Tier)'
-          : 'Score <= 600 (12% Tier)'
-        : 'Pending Verification',
+        ? cibilScore > threshold
+          ? `Score > ${threshold} (${highRate}% Tier)`
+          : `Score <= ${threshold} (${stdRate}% Tier)`
+        : `${calculatedRate}% Standard Policy`,
       preferredTenureMonths: tenureNum,
-      loanPurpose: loanPurpose.trim(),
+      loanPurpose: finalLoanPurpose,
       employmentDetails: {
         occupationType: occupationType ? occupationType.trim() : 'Self-Employed / Business',
-        monthlyIncome: monthlyIncome ? Number(monthlyIncome) : 0,
+        monthlyIncome: finalMonthlyIncome,
         employerOrBusinessName: employerOrBusinessName ? employerOrBusinessName.trim() : '',
         workAddress: workAddress ? workAddress.trim() : '',
       },
       documents,
-      status: 'Pending District Verification',
+      status: 'Pending Final Approval',
       districtVerification: {
-        status: 'Pending',
+        status: 'Verified',
         districtId: finalDistrictId,
+        isForwardedToSuperAdmin: true,
+        forwardedToSuperAdminAt: new Date(),
         districtRemarks: isDistrictAdminAssigned
-          ? `Automatically assigned to ${finalDistrictName} District Administration (${assignedAdminName}) for verification.`
-          : `Awaiting District Admin assignment for ${finalDistrictName} circle.`,
+          ? `Direct application routed to Super Admin for approval. Jurisdiction: ${finalDistrictName} District (${assignedAdminName}).`
+          : `Direct application routed to Super Admin for approval. (District: ${finalDistrictName})`,
       },
       finalApproval: {
         status: 'Pending',
@@ -866,12 +926,12 @@ const applyForLoan = async (req, res) => {
     });
 
     console.log(
-      `[LoanApplication] New client-policy application created: ${newLoanApp.applicationId} for member ${resolvedMemberId} in ${finalDistrictName} (Assigned to Admin: ${isDistrictAdminAssigned ? assignedAdminName : 'Unassigned'})`
+      `[LoanApplication] Direct Super Admin loan application created: ${newLoanApp.applicationId} for member ${resolvedMemberId} in ${finalDistrictName} (District Admin: ${isDistrictAdminAssigned ? assignedAdminName : 'Unassigned'})`
     );
 
     return res.status(201).json({
       success: true,
-      message: `First Member Loan application (${newLoanApp.applicationId}) for ₹10,000 with ${tenureNum} Months tenure submitted successfully! Routed to ${finalDistrictName} District Administration for verification.`,
+      message: `First Member Loan application (${newLoanApp.applicationId}) for ₹${requestedAmount.toLocaleString('en-IN')} with ${tenureNum} Months tenure submitted successfully! Routed directly to Super Admin for final review and sanction.`,
       application: newLoanApp,
       isDistrictAdminAssigned,
     });
@@ -998,7 +1058,14 @@ const getEmiSchedule = async (req, res) => {
     // Synchronize or generate EMI schedule under Option 1 (Reducing Balance EMI) policy
     generateOrSyncEmiSchedule(disbursedLoan);
     if (disbursedLoan.isModified && disbursedLoan.isModified()) {
-      await disbursedLoan.save();
+      try {
+        await LoanApplication.updateOne(
+          { _id: disbursedLoan._id },
+          { $set: { repayment: disbursedLoan.repayment } }
+        );
+      } catch (saveErr) {
+        console.warn('Silent sync error for loan repayment:', saveErr.message);
+      }
     }
 
     const loanAmount =
@@ -1047,10 +1114,10 @@ const getEmiSchedule = async (req, res) => {
       loanId: disbursedLoan.loanId || `LN-${disbursedLoan.applicationId.replace('LOAN-', '')}`,
       applicationId: disbursedLoan.applicationId,
       loanAmount,
-      interestRate: `${interestRate}% p.a. (Awaiting Final Confirmation - 11%/12% CIBIL Policy)`,
+      interestRate: interestRate <= 5 ? `${interestRate}% / Month` : `${interestRate}% p.a.`,
       interestCalculationNotice:
-        'Option 1: Reducing Balance EMI method (11% for CIBIL > 600, 12% for CIBIL <= 600). The complete interest rules and repayment policy are awaiting final confirmation by client management. Official EMI collection and online payments are paused until confirmation.',
-      canPay: false,
+        'Reducing Balance EMI calculation under approved Utkal Finance Member Credit Policy.',
+      canPay: true,
       repaymentTenure: `${tenureMonths} Months`,
       totalPayableAmount,
       monthlyEmi,
@@ -1224,7 +1291,7 @@ const getCustomerActiveLoans = async (req, res) => {
         approvedAmount: approvedAmt,
         disbursedAmount: disbursedAmt,
         disbursedAt: loan.disbursement?.disbursedAt || loan.updatedAt,
-        interestDetails: `${rate}% p.a. Fixed`,
+        interestDetails: rate <= 5 ? `${rate}% / Month (Reducing Balance)` : `${rate}% p.a. (Reducing Balance)`,
         interestRate: rate,
         loanTenure: `${tenure} Months`,
         preferredTenureMonths: tenure,
@@ -1280,7 +1347,14 @@ const getCustomerRepayments = async (req, res) => {
     for (const loan of disbursedLoans) {
       generateOrSyncEmiSchedule(loan);
       if (loan.isModified && loan.isModified()) {
-        await loan.save();
+        try {
+          await LoanApplication.updateOne(
+            { _id: loan._id },
+            { $set: { repayment: loan.repayment } }
+          );
+        } catch (saveErr) {
+          console.warn('Silent sync error for loan repayment:', saveErr.message);
+        }
       }
 
       const schedule = loan.repayment?.schedule || [];
@@ -1523,10 +1597,12 @@ const getSuperAdminLoanStats = async (req, res) => {
       (l) =>
         l.status === 'Pending Final Approval' ||
         l.status === 'Forwarded to Super Admin' ||
-        (l.districtVerification?.status === 'Verified' &&
-          (l.finalApproval?.status === 'Pending' || !l.finalApproval?.status)) ||
-        (l.districtVerification?.isForwardedToSuperAdmin === true &&
-          (l.finalApproval?.status === 'Pending' || !l.finalApproval?.status))
+        l.status === 'Pending District Verification' ||
+        l.status === 'Submitted' ||
+        l.status === 'Under Verification' ||
+        l.status === 'On Hold' ||
+        (l.finalApproval?.status === 'Pending' &&
+          !['Approved', 'Approved – Not Disbursed', 'Approved - Not Disbursed', 'Rejected', 'Disbursed', 'Active'].includes(l.status))
     ).length;
 
     const approvedLoans = allLoans.filter(
@@ -1609,6 +1685,182 @@ const getSuperAdminLoanStats = async (req, res) => {
 };
 
 /**
+ * Helper to enrich loan application with Member dossier and Membership application KYC documents
+ * Guarantees Super Admin reviews both loan-specific uploads and verified member proofs
+ */
+const enrichLoanWithMemberKyc = async (loan) => {
+  if (!loan) return loan;
+  const loanObj = loan.toObject ? loan.toObject() : { ...loan };
+
+  let memberData = null;
+  let applicationData = null;
+
+  try {
+    if (loanObj.memberId) {
+      const orMember = [
+        { memberId: loanObj.memberId },
+        { customerId: loanObj.memberId },
+      ];
+      if (mongoose.isValidObjectId(loanObj.memberId)) {
+        orMember.push({ _id: loanObj.memberId });
+      }
+      memberData = await Member.findOne({ $or: orMember }).lean();
+
+      applicationData = await Application.findOne({
+        $or: [
+          { allocatedMemberId: loanObj.memberId },
+          { memberId: loanObj.memberId },
+          { mobile: loanObj.mobile },
+          { email: loanObj.email },
+        ].filter(Boolean),
+      }).lean();
+    } else if (loanObj.userId) {
+      memberData = await Member.findOne({ userId: loanObj.userId }).lean();
+      applicationData = await Application.findOne({ userId: loanObj.userId }).lean();
+    }
+  } catch (err) {
+    console.warn('enrichLoanWithMemberKyc lookup error:', err.message);
+  }
+
+  // Preserve existing direct loan application documents
+  const mergedDocs = Array.isArray(loanObj.documents) ? [...loanObj.documents] : [];
+  const docTypes = new Set(
+    mergedDocs.map((d) => (d.documentType || d.documentName || '').toLowerCase().trim())
+  );
+  const docUrls = new Set(
+    mergedDocs.map((d) => (d.documentUrl || d.fileUrl || '').trim())
+  );
+
+  const addDocIfMissing = (type, path, name) => {
+    if (path && typeof path === 'string') {
+      const cleanPath = path.trim();
+      const normType = type.toLowerCase().trim();
+      if (cleanPath && !docUrls.has(cleanPath) && !docTypes.has(normType)) {
+        mergedDocs.push({
+          documentType: type,
+          documentName: name || `${type} Proof`,
+          documentUrl: cleanPath,
+          fileUrl: cleanPath,
+          uploadedAt: applicationData?.updatedAt || memberData?.updatedAt || loanObj.createdAt,
+          verificationStatus: 'Verified',
+          source: 'member_dossier',
+        });
+        docTypes.add(normType);
+        docUrls.add(cleanPath);
+      }
+    }
+  };
+
+  const docSource = applicationData?.documentDetails || memberData?.documentDetails || {};
+
+  // 1. Identity Proof / Aadhaar Front
+  const idProof =
+    docSource.idProofUrl ||
+    docSource.idProofFile ||
+    docSource.idProof ||
+    docSource.doc2_govId ||
+    applicationData?.idProofUrl ||
+    memberData?.idProofUrl ||
+    applicationData?.aadhaarFrontUrl ||
+    memberData?.aadhaarFrontUrl;
+  if (idProof) {
+    addDocIfMissing('Aadhaar / ID Proof (Front)', idProof, 'Aadhaar Card / Primary ID Proof');
+  }
+
+  // 2. Address Proof / Aadhaar Back
+  const addrProof =
+    docSource.addressProofUrl ||
+    docSource.addressProofFile ||
+    docSource.addressProof ||
+    applicationData?.addressProofUrl ||
+    memberData?.addressProofUrl ||
+    applicationData?.aadhaarBackUrl ||
+    memberData?.aadhaarBackUrl;
+  if (addrProof) {
+    addDocIfMissing('Address Proof / ID (Back)', addrProof, 'Registered Address Proof / Aadhaar Back');
+  }
+
+  // 3. PAN Card
+  const panProof =
+    docSource.panCardUrl ||
+    docSource.panCardFile ||
+    docSource.panCard ||
+    applicationData?.panCardUrl ||
+    memberData?.panCardUrl ||
+    applicationData?.panCard ||
+    memberData?.panCard;
+  if (panProof) {
+    addDocIfMissing('PAN Card', panProof, 'Income Tax PAN Card');
+  }
+
+  // 4. Passport Photograph
+  const photo =
+    docSource.photoUrl ||
+    docSource.photoFile ||
+    docSource.photo ||
+    docSource.doc1_photo ||
+    applicationData?.photoUrl ||
+    memberData?.photoUrl ||
+    applicationData?.photo ||
+    memberData?.photo;
+  if (photo) {
+    addDocIfMissing('Applicant Photo', photo, 'Passport Photograph');
+  }
+
+  // 5. Specimen Signature
+  const signature =
+    docSource.signatureUrl ||
+    docSource.signatureFile ||
+    docSource.signature ||
+    applicationData?.signatureUrl ||
+    memberData?.signatureUrl ||
+    applicationData?.signature ||
+    memberData?.signature;
+  if (signature) {
+    addDocIfMissing('Applicant Signature', signature, 'Specimen Signature');
+  }
+
+  // 6. Payment / Membership Receipt
+  const receipt =
+    docSource.paymentReceiptUrl ||
+    applicationData?.paymentDetails?.receiptUrl ||
+    memberData?.paymentDetails?.receiptUrl ||
+    applicationData?.paymentReceiptUrl ||
+    applicationData?.receiptFile;
+  if (receipt) {
+    addDocIfMissing('Payment Receipt', receipt, 'Membership Fee Receipt');
+  }
+
+  // 7. Additional Documents array from application/member
+  if (Array.isArray(docSource.additionalDocuments)) {
+    docSource.additionalDocuments.forEach((addDoc) => {
+      if (addDoc && addDoc.documentUrl) {
+        addDocIfMissing(
+          addDoc.documentType || 'Additional Document',
+          addDoc.documentUrl,
+          addDoc.documentName || 'Supporting KYC Document'
+        );
+      }
+    });
+  }
+
+  loanObj.documents = mergedDocs;
+  loanObj.memberProfile = memberData || loanObj.memberProfile || null;
+  loanObj.membershipApplication = applicationData
+    ? {
+        applicationNumber: applicationData.applicationNumber,
+        status: applicationData.status,
+        branchName: applicationData.branchName,
+        kycStatus: applicationData.kycStatus,
+        submittedAt: applicationData.createdAt,
+        approvedAt: applicationData.approvedAt,
+      }
+    : loanObj.membershipApplication || null;
+
+  return loanObj;
+};
+
+/**
  * @desc    Get loan applications verified and forwarded by District Admin awaiting Super Admin final approval
  * @route   GET /api/loan-applications/admin/pending-final-approval
  * @access  Private (Super Admin / Admin)
@@ -1619,14 +1871,30 @@ const getSuperAdminPendingFinalApprovals = async (req, res) => {
 
     const baseFilter = {
       $or: [
-        { status: { $in: ['Pending Final Approval', 'Forwarded to Super Admin'] } },
         {
-          'districtVerification.status': 'Verified',
-          status: { $nin: ['Approved', 'Rejected', 'Disbursed'] },
+          status: {
+            $in: [
+              'Pending Final Approval',
+              'Forwarded to Super Admin',
+              'Pending District Verification',
+              'Submitted',
+              'Under Verification',
+              'On Hold',
+            ],
+          },
         },
         {
-          'districtVerification.isForwardedToSuperAdmin': true,
-          status: { $nin: ['Approved', 'Rejected', 'Disbursed'] },
+          'finalApproval.status': { $in: ['Pending', 'On Hold', null] },
+          status: {
+            $nin: [
+              'Approved',
+              'Approved – Not Disbursed',
+              'Approved - Not Disbursed',
+              'Rejected',
+              'Disbursed',
+              'Active',
+            ],
+          },
         },
       ],
     };
@@ -1659,39 +1927,49 @@ const getSuperAdminPendingFinalApprovals = async (req, res) => {
       .sort({ 'districtVerification.forwardedToSuperAdminAt': -1, updatedAt: -1, createdAt: -1 })
       .lean();
 
-    const formatted = loans.map((loan) => ({
-      _id: loan._id,
-      applicationId: loan.applicationId,
-      customerName: loan.applicantName,
-      memberId: loan.memberId,
-      district: loan.district,
-      districtId: loan.districtId,
-      requestedLoanAmount: loan.requestedAmount || 10000,
-      selectedTenure: `${loan.preferredTenureMonths} Months`,
-      preferredTenureMonths: loan.preferredTenureMonths,
-      interestRate: loan.interestRate || 5,
-      districtVerificationStatus: loan.districtVerification?.status || 'Verified',
-      districtAdminRemarks:
-        loan.districtVerification?.districtRemarks ||
-        'Verified and forwarded by District Administration for final sanction.',
-      districtAdminName: loan.districtVerification?.verifiedBy || 'District Admin',
-      forwardedDate:
-        loan.districtVerification?.forwardedToSuperAdminAt ||
-        loan.districtVerification?.verifiedAt ||
-        loan.updatedAt,
-      districtVerificationDate:
-        loan.districtVerification?.verifiedAt ||
-        loan.districtVerification?.decisionDate ||
-        loan.districtVerification?.forwardedToSuperAdminAt ||
-        loan.updatedAt,
-      submittedDate: loan.createdAt,
-      status: loan.status,
-      finalApprovalStatus: loan.finalApproval?.status || 'Pending',
-      loanPurpose: loan.loanPurpose,
-      employmentDetails: loan.employmentDetails,
-      documents: loan.documents || [],
-      verificationActivities: loan.verificationActivities || [],
-    }));
+    const formatted = await Promise.all(
+      loans.map(async (loan) => {
+        const enriched = await enrichLoanWithMemberKyc(loan);
+        return {
+          _id: enriched._id,
+          applicationId: enriched.applicationId,
+          customerName: enriched.applicantName,
+          memberId: enriched.memberId,
+          district: enriched.district,
+          districtId: enriched.districtId,
+          requestedLoanAmount: enriched.requestedAmount || 10000,
+          selectedTenure: `${enriched.preferredTenureMonths} Months`,
+          preferredTenureMonths: enriched.preferredTenureMonths,
+          interestRate: enriched.interestRate || 5,
+          districtVerificationStatus:
+            enriched.districtVerification?.status === 'Verified'
+              ? 'Verified'
+              : 'Direct to Super Admin',
+          districtAdminRemarks:
+            enriched.districtVerification?.districtRemarks ||
+            'Direct member application routed to Super Admin for approval.',
+          districtAdminName: enriched.districtVerification?.verifiedBy || 'District Admin',
+          forwardedDate:
+            enriched.districtVerification?.forwardedToSuperAdminAt ||
+            enriched.districtVerification?.verifiedAt ||
+            enriched.updatedAt,
+          districtVerificationDate:
+            enriched.districtVerification?.verifiedAt ||
+            enriched.districtVerification?.decisionDate ||
+            enriched.districtVerification?.forwardedToSuperAdminAt ||
+            enriched.updatedAt,
+          submittedDate: enriched.createdAt,
+          status: enriched.status,
+          finalApprovalStatus: enriched.finalApproval?.status || 'Pending',
+          loanPurpose: enriched.loanPurpose,
+          employmentDetails: enriched.employmentDetails,
+          documents: enriched.documents || [],
+          memberProfile: enriched.memberProfile,
+          membershipApplication: enriched.membershipApplication,
+          verificationActivities: enriched.verificationActivities || [],
+        };
+      })
+    );
 
     return res.status(200).json({
       success: true,
@@ -1839,68 +2117,73 @@ const getSuperAdminAllLoanApplications = async (req, res) => {
       LoanApplication.countDocuments(query),
     ]);
 
-    const formattedApplications = loans.map((loan) => {
-      const isDisbursed = Boolean(
-        loan.disbursement?.isDisbursed || loan.status === 'Active' || loan.status === 'Disbursed'
-      );
-      const isApproved = Boolean(
-        loan.status === 'Approved' ||
-        loan.status === 'Approved – Not Disbursed' ||
-        loan.status === 'Approved - Not Disbursed' ||
-        loan.finalApproval?.status === 'Approved'
-      );
-      const isForwarded = Boolean(
-        loan.status === 'Forwarded to Super Admin' ||
-        loan.status === 'Pending Final Approval' ||
-        loan.districtVerification?.isForwardedToSuperAdmin === true ||
-        loan.districtVerification?.status === 'Verified'
-      );
+    const formattedApplications = await Promise.all(
+      loans.map(async (rawLoan) => {
+        const loan = await enrichLoanWithMemberKyc(rawLoan);
+        const isDisbursed = Boolean(
+          loan.disbursement?.isDisbursed || loan.status === 'Active' || loan.status === 'Disbursed'
+        );
+        const isApproved = Boolean(
+          loan.status === 'Approved' ||
+          loan.status === 'Approved – Not Disbursed' ||
+          loan.status === 'Approved - Not Disbursed' ||
+          loan.finalApproval?.status === 'Approved'
+        );
+        const isForwarded = Boolean(
+          loan.status === 'Forwarded to Super Admin' ||
+          loan.status === 'Pending Final Approval' ||
+          loan.districtVerification?.isForwardedToSuperAdmin === true ||
+          loan.districtVerification?.status === 'Verified'
+        );
 
-      let canonicalStatus = loan.status;
-      if (isDisbursed) {
-        canonicalStatus = 'Active';
-      } else if (isApproved) {
-        canonicalStatus = 'Approved – Not Disbursed';
-      } else if (isForwarded) {
-        canonicalStatus = 'Verified / Forwarded to Super Admin';
-      } else if (!loan.status || loan.status === 'Submitted') {
-        canonicalStatus = 'Pending District Verification';
-      }
+        let canonicalStatus = loan.status;
+        if (isDisbursed) {
+          canonicalStatus = 'Active';
+        } else if (isApproved) {
+          canonicalStatus = 'Approved – Not Disbursed';
+        } else if (isForwarded) {
+          canonicalStatus = 'Verified / Forwarded to Super Admin';
+        } else if (!loan.status || loan.status === 'Submitted') {
+          canonicalStatus = 'Pending District Verification';
+        }
 
-      return {
-        _id: loan._id,
-        applicationId: loan.applicationId,
-        applicantName: loan.applicantName,
-        customerName: loan.applicantName,
-        memberId: loan.memberId,
-        customerId: loan.memberId,
-        district: loan.district || 'Khurda',
-        requestedAmount: loan.requestedAmount || 10000,
-        sanctionedAmount:
-          loan.finalApproval?.approvedAmount || loan.sanctionedAmount || loan.requestedAmount || 10000,
-        preferredTenureMonths:
-          loan.finalApproval?.approvedTenureMonths || loan.preferredTenureMonths || 3,
-        tenure: `${
-          loan.finalApproval?.approvedTenureMonths || loan.preferredTenureMonths || 3
-        } Months`,
-        interestRate: loan.interestRate || 5,
-        submissionDate: loan.createdAt,
-        createdAt: loan.createdAt,
-        status: canonicalStatus,
-        rawStatus: loan.status,
-        loanType: loan.loanType,
-        mobile: loan.mobile,
-        email: loan.email,
-        loanPurpose: loan.loanPurpose,
-        employmentDetails: loan.employmentDetails,
-        documents: loan.documents || [],
-        customerVerification: loan.customerVerification || {},
-        districtVerification: loan.districtVerification || {},
-        finalApproval: loan.finalApproval || {},
-        disbursement: loan.disbursement || { isDisbursed: false },
-        verificationActivities: loan.verificationActivities || [],
-      };
-    });
+        return {
+          _id: loan._id,
+          applicationId: loan.applicationId,
+          applicantName: loan.applicantName,
+          customerName: loan.applicantName,
+          memberId: loan.memberId,
+          customerId: loan.memberId,
+          district: loan.district || 'Khurda',
+          requestedAmount: loan.requestedAmount || 10000,
+          sanctionedAmount:
+            loan.finalApproval?.approvedAmount || loan.sanctionedAmount || loan.requestedAmount || 10000,
+          preferredTenureMonths:
+            loan.finalApproval?.approvedTenureMonths || loan.preferredTenureMonths || 3,
+          tenure: `${
+            loan.finalApproval?.approvedTenureMonths || loan.preferredTenureMonths || 3
+          } Months`,
+          interestRate: loan.interestRate || 5,
+          submissionDate: loan.createdAt,
+          createdAt: loan.createdAt,
+          status: canonicalStatus,
+          rawStatus: loan.status,
+          loanType: loan.loanType,
+          mobile: loan.mobile,
+          email: loan.email,
+          loanPurpose: loan.loanPurpose,
+          employmentDetails: loan.employmentDetails,
+          documents: loan.documents || [],
+          memberProfile: loan.memberProfile || null,
+          membershipApplication: loan.membershipApplication || null,
+          customerVerification: loan.customerVerification || {},
+          districtVerification: loan.districtVerification || {},
+          finalApproval: loan.finalApproval || {},
+          disbursement: loan.disbursement || { isDisbursed: false },
+          verificationActivities: loan.verificationActivities || [],
+        };
+      })
+    );
 
     return res.status(200).json({
       success: true,
@@ -2048,9 +2331,17 @@ const getSuperAdminLoanApplicationById = async (req, res) => {
       });
     }
 
+    const loanObj = await enrichLoanWithMemberKyc(loan);
+
+    try {
+      generateOrSyncEmiSchedule(loanObj);
+    } catch (e) {
+      console.warn('Could not sync EMI schedule for loan application:', e.message);
+    }
+
     return res.status(200).json({
       success: true,
-      loan,
+      loan: loanObj,
     });
   } catch (error) {
     console.error('Error fetching loan application details:', error);
@@ -2068,6 +2359,13 @@ const getSuperAdminLoanApplicationById = async (req, res) => {
  */
 const superAdminProcessLoanDecision = async (req, res) => {
   try {
+    if (req.user?.role !== 'super_admin' && req.user?.role !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied. Only Super Admin can approve, reject, or place loans on hold.',
+      });
+    }
+
     const rawId = req.params.id || req.body.id || req.body.applicationId;
     const {
       action, // 'approve' | 'reject' | 'hold'
@@ -2670,7 +2968,14 @@ const getSuperAdminEmiDashboard = async (req, res) => {
     for (const loan of disbursedLoans) {
       generateOrSyncEmiSchedule(loan);
       if (loan.isModified && loan.isModified()) {
-        await loan.save();
+        try {
+          await LoanApplication.updateOne(
+            { _id: loan._id },
+            { $set: { repayment: loan.repayment } }
+          );
+        } catch (saveErr) {
+          console.warn('Silent sync error for loan repayment:', saveErr.message);
+        }
       }
 
       const balance = Number(loan.repayment?.outstandingBalance ?? 0);
@@ -2758,7 +3063,14 @@ const getSuperAdminAllEmis = async (req, res) => {
     for (const loan of loans) {
       generateOrSyncEmiSchedule(loan);
       if (loan.isModified && loan.isModified()) {
-        await loan.save();
+        try {
+          await LoanApplication.updateOne(
+            { _id: loan._id },
+            { $set: { repayment: loan.repayment } }
+          );
+        } catch (saveErr) {
+          console.warn('Silent sync error for loan repayment:', saveErr.message);
+        }
       }
 
       const schedule = loan.repayment?.schedule || [];
@@ -3221,6 +3533,128 @@ const getSuperAdminEmiReports = async (req, res) => {
   }
 };
 
+/**
+ * @desc    Get dynamic loan and EMI configuration settings
+ * @route   GET /api/loan-applications/settings
+ * @access  Private (Authenticated User - Member or Admin)
+ */
+const getLoanSettings = async (req, res) => {
+  try {
+    const settings = await LoanSetting.getOrCreateDefault();
+    return res.status(200).json({
+      success: true,
+      settings,
+    });
+  } catch (error) {
+    console.error('Error fetching loan settings:', error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to fetch loan settings',
+    });
+  }
+};
+
+/**
+ * @desc    Update dynamic loan amount, interest rate, and EMI configuration settings
+ * @route   PUT /api/loan-applications/admin/settings
+ * @access  Private (Super Admin / Admin)
+ */
+const updateLoanSettings = async (req, res) => {
+  try {
+    if (req.user?.role !== 'super_admin' && req.user?.role !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied. Only Super Admin can modify loan configuration settings.',
+      });
+    }
+
+    const {
+      defaultAmount,
+      minAmount,
+      maxAmount,
+      isAmountFixed,
+      allowedAmounts,
+      monthlyInterestRate,
+      baseInterestRate,
+      highCibilInterestRate,
+      standardCibilInterestRate,
+      cibilThreshold,
+      interestRateDisplay,
+      availableTenureMonths,
+      defaultTenureMonths,
+      emiCalculationMethod,
+      processingFeePercent,
+      processingFeeFixed,
+      aboutEmiNote,
+      repaymentGuidelines,
+      policyReference,
+    } = req.body;
+
+    const settings = await LoanSetting.getOrCreateDefault();
+
+    if (defaultAmount !== undefined) settings.defaultAmount = Math.max(1000, Number(defaultAmount));
+    if (minAmount !== undefined) settings.minAmount = Math.max(1000, Number(minAmount));
+    if (maxAmount !== undefined) settings.maxAmount = Math.max(settings.minAmount, Number(maxAmount));
+    if (isAmountFixed !== undefined) settings.isAmountFixed = Boolean(isAmountFixed);
+    if (Array.isArray(allowedAmounts) && allowedAmounts.length > 0) {
+      settings.allowedAmounts = allowedAmounts
+        .map(Number)
+        .filter((n) => !isNaN(n) && n > 0);
+    }
+
+    if (monthlyInterestRate !== undefined) {
+      settings.monthlyInterestRate = Number(monthlyInterestRate);
+      if (baseInterestRate === undefined) {
+        settings.baseInterestRate = Number(monthlyInterestRate) * 12;
+      }
+    }
+    if (baseInterestRate !== undefined) settings.baseInterestRate = Number(baseInterestRate);
+    if (highCibilInterestRate !== undefined) settings.highCibilInterestRate = Number(highCibilInterestRate);
+    if (standardCibilInterestRate !== undefined) settings.standardCibilInterestRate = Number(standardCibilInterestRate);
+    if (cibilThreshold !== undefined) settings.cibilThreshold = Number(cibilThreshold);
+    if (interestRateDisplay !== undefined) settings.interestRateDisplay = String(interestRateDisplay).trim();
+
+    if (Array.isArray(availableTenureMonths) && availableTenureMonths.length > 0) {
+      settings.availableTenureMonths = availableTenureMonths
+        .map(Number)
+        .filter((n) => !isNaN(n) && n > 0)
+        .sort((a, b) => a - b);
+    }
+    if (defaultTenureMonths !== undefined) settings.defaultTenureMonths = Number(defaultTenureMonths);
+    if (emiCalculationMethod && ['reducing_balance', 'flat_rate'].includes(emiCalculationMethod)) {
+      settings.emiCalculationMethod = emiCalculationMethod;
+    }
+    if (processingFeePercent !== undefined) settings.processingFeePercent = Number(processingFeePercent);
+    if (processingFeeFixed !== undefined) settings.processingFeeFixed = Number(processingFeeFixed);
+    if (aboutEmiNote !== undefined) settings.aboutEmiNote = String(aboutEmiNote).trim();
+    if (Array.isArray(repaymentGuidelines)) {
+      settings.repaymentGuidelines = repaymentGuidelines.filter((g) => typeof g === 'string' && g.trim());
+    }
+    if (policyReference !== undefined) settings.policyReference = String(policyReference).trim();
+
+    settings.updatedBy = req.user?.name || req.user?.email || 'Super Admin';
+    settings.updatedById = req.user?._id || 'admin-root';
+
+    await settings.save();
+
+    console.log(
+      `[LoanSetting] Dynamic Loan & EMI policy updated by ${settings.updatedBy}: Amount ₹${settings.defaultAmount}, Rate ${settings.baseInterestRate}%, Tenures [${settings.availableTenureMonths.join(', ')}]`
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: 'Loan parameters and EMI configuration updated successfully! Changes are live across the member panel.',
+      settings,
+    });
+  } catch (error) {
+    console.error('Error updating loan settings:', error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to update loan settings',
+    });
+  }
+};
+
 module.exports = {
   getCustomerLoanOverview,
   getAvailableLoanProducts,
@@ -3246,4 +3680,6 @@ module.exports = {
   getSuperAdminAllEmis,
   superAdminCollectEmiPayment,
   getSuperAdminEmiReports,
+  getLoanSettings,
+  updateLoanSettings,
 };

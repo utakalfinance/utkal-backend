@@ -154,8 +154,24 @@ const loginUser = async (req, res) => {
       });
     }
 
-    // Verify applicant's linked application status strictly for members
-    if (user.role === 'member') {
+    // Verify applicant's linked application and approval status for members and associates
+    if (user.role === 'member' || user.role === 'associate') {
+      if (user.approvalStatus === 'pending') {
+        return res.status(403).json({
+          success: false,
+          approvalStatus: 'pending',
+          message: 'Your registration is currently pending admin approval. Access to the portal is not permitted until approved.',
+        });
+      }
+
+      if (user.approvalStatus === 'rejected') {
+        return res.status(403).json({
+          success: false,
+          approvalStatus: 'rejected',
+          message: 'Your registration application has been rejected by the administrator. Access to the dashboard is not permitted.',
+        });
+      }
+
       if (!linkedApp) {
         linkedApp = user.applicationId
           ? await Application.findById(user.applicationId)
@@ -173,10 +189,12 @@ const loginUser = async (req, res) => {
       if (linkedApp && linkedApp.status === 'rejected') {
         if (user.status === 'active') {
           user.status = 'inactive';
+          user.approvalStatus = 'rejected';
           await user.save().catch(() => {});
         }
         return res.status(403).json({
           success: false,
+          approvalStatus: 'rejected',
           message: 'Your membership application has been rejected by the administrator. Access to the Member Dashboard is not permitted.',
         });
       }
@@ -184,6 +202,7 @@ const loginUser = async (req, res) => {
       if (linkedApp && linkedApp.status === 'pending') {
         return res.status(403).json({
           success: false,
+          approvalStatus: 'pending',
           message: 'Your membership application is currently pending admin approval. You will receive an email once approved.',
         });
       }
@@ -217,7 +236,7 @@ const loginUser = async (req, res) => {
     let applicationData = null;
     let formattedPayments = [];
 
-    if (user.role === 'member') {
+    if (user.role === 'member' || user.role === 'associate') {
       const [m, a, pDocs] = await Promise.all([
         Member.findOne({
           $or: [
@@ -277,6 +296,7 @@ const loginUser = async (req, res) => {
         districtId: user.districtId || null,
         assignedDistrict: user.assignedDistrict || null,
         status: user.status,
+        approvalStatus: user.approvalStatus || 'approved',
         mustChangePassword: user.mustChangePassword ?? true,
         applicationId: user.applicationId,
       },
@@ -400,6 +420,7 @@ const getMe = async (req, res) => {
         mobile: user.mobile,
         role: user.role,
         status: user.status,
+        approvalStatus: user.approvalStatus || 'approved',
         mustChangePassword: user.mustChangePassword ?? true,
         applicationId: user.applicationId,
         createdAt: user.createdAt,
