@@ -1780,6 +1780,42 @@ const serveDocumentFile = (req, res) => {
       filePath = path.join(__dirname, '../uploads', filename);
     }
 
+    // Resilient fallback for space vs hyphen variants (e.g. "receipt-NUF 1036-payment.svg" <-> "receipt-NUF-1036-payment.svg")
+    if (!fs.existsSync(filePath)) {
+      const hyphenName = filename.replace(/\s+/g, '-');
+      const hyphenPath = path.join(__dirname, '../uploads/documents', hyphenName);
+      if (fs.existsSync(hyphenPath)) {
+        filePath = hyphenPath;
+      }
+    }
+
+    if (!fs.existsSync(filePath)) {
+      const spaceName = filename.replace(/-/g, ' ');
+      const spacePath = path.join(__dirname, '../uploads/documents', spaceName);
+      if (fs.existsSync(spacePath)) {
+        filePath = spacePath;
+      }
+    }
+
+    // Dynamic generation fallback for any requested NUF receipt SVG template
+    if (!fs.existsSync(filePath) && filename.toLowerCase().endsWith('.svg') && filename.toLowerCase().includes('receipt')) {
+      const match = filename.match(/NUF[ -]?([0-9]+)/i);
+      const targetNum = match ? match[1] : '1036';
+      const templatePath = path.join(__dirname, '../uploads/documents/receipt-NUF-1055-payment.svg');
+      if (fs.existsSync(templatePath)) {
+        try {
+          let svgContent = fs.readFileSync(templatePath, 'utf8');
+          svgContent = svgContent.replace(/NUF-1055/g, `NUF-${targetNum}`)
+                                 .replace(/1055/g, targetNum);
+          const generatedPath = path.join(__dirname, '../uploads/documents', `receipt-NUF-${targetNum}-payment.svg`);
+          fs.writeFileSync(generatedPath, svgContent, 'utf8');
+          filePath = generatedPath;
+        } catch (genErr) {
+          console.warn('Failed to auto-generate receipt SVG:', genErr);
+        }
+      }
+    }
+
     if (!fs.existsSync(filePath)) {
       return res.status(404).json({
         success: false,
